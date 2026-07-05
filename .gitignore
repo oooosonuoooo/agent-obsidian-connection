@@ -1,0 +1,66 @@
+# ========================
+# Agent Obsidian Connection - .gitignore
+# ========================
+
+# Environment secrets - NEVER commit
+.env
+.env.local
+.env.*
+!.env.example
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg
+*.egg-info/
+dist/
+build/
+
+# Virtual environments
+venv/
+.venv/
+ENV/
+env/
+
+# Logs
+*.log
+logs/
+*.log.*
+
+# Database runtime files (contain agent messages, tokens)
+*.sqlite
+*.sqlite3
+*.sqlite-shm
+*.sqlite-wal
+*.db
+
+# Lock/PID files
+*.pid
+locks/
+
+# Inbox / outbox runtime data
+inbox/
+outbox/
+exports/
+
+# Keys and certificates
+*.pem
+*.key
+*.crt
+
+# Backup files
+*.bak
+*.backup
+*.tmp
+*.orig
+
+# System files
+.DS_Store
+Thumbs.db
+*.swp
+*~
+
+# IDE
+.vscode/
+.idea/
