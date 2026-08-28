@@ -11,8 +11,7 @@ Restart=on-failure
 RestartSec=5
 StandardOutput=append:%h/AI-Second-Brain/.agent_mesh/logs/agent_mesh.log
 StandardError=append:%h/AI-Second-Brain/.agent_mesh/logs/agent_mesh.log
-# Load your token and config from the environment file
-EnvironmentFile=-%h/AI-Second-Brain/.env.local
+UMask=0077
 
 [Install]
 WantedBy=default.target

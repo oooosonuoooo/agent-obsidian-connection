@@ -13,6 +13,7 @@ The system consists of two core components:
 1. **Agent Mesh** — A lightweight local HTTP service (Python, SQLite) that provides:
    - Agent registration and discovery
    - Message passing between agents
+   - Durable multi-agent orchestration (DAGs, ACKs, results, verification, retries)
    - Task lifecycle management (create, claim, heartbeat, release)
    - Handoff coordination between agents
    - Skill and MCP server registry
@@ -37,6 +38,7 @@ Both components expose **MCP (Model Context Protocol) stdio bridges** for AI age
 - 🔒 **Token-authenticated** — all sensitive endpoints require a local bearer token
 - 🌉 **Friday bridge** — dedicated heartbeat bridge for the Friday local LLM assistant
 - 🔄 **Task leasing** — agents can claim, heartbeat, and release tasks to avoid conflicts
+- 🧭 **Durable orchestration** — lead-agent planning, capability routing, task DAGs, ACK/result protocol, verification, retries, and reassignment
 - 💾 **SQLite backend** — lightweight, no external database required
 - 🛡️ **Zero-trust design** — all services bind to `127.0.0.1` only, no external exposure
 - 🧠 **Shared memory** — any agent can read and write to the shared vault and memory store
@@ -54,6 +56,8 @@ Both components expose **MCP (Model Context Protocol) stdio bridges** for AI age
 | Disk | < 50 MB (SQLite + vault markdown files) |
 
 No additional pip packages are required for the core Agent Mesh service — it uses only the Python standard library.
+
+See [ORCHESTRATION.md](ORCHESTRATION.md) for the failure diagnosis, shared-runtime deployment, protocol, API, and worker contract.
 
 ---
 
@@ -112,6 +116,16 @@ export AGENT_MESH_PORT=17860
 # Friday bridge settings (if using Friday local LLM)
 # export FRIDAY_LOCAL_BASE_URL=http://127.0.0.1:8765
 # export FRIDAY_WEB_TOKEN=your_friday_web_token_here
+
+# Durable orchestration settings (safe defaults)
+# export AGENT_ACK_TIMEOUT=30
+# export AGENT_EXECUTION_TIMEOUT=1800
+# export AGENT_MAX_RETRIES=2
+# export AGENT_RETRY_BACKOFF=2
+# export AGENT_HEARTBEAT_TIMEOUT=120
+# export MAX_PARALLEL_AGENT_TASKS=8
+# export MAX_DELEGATION_DEPTH=3
+# export AGENT_MESH_REAPER_INTERVAL=1
 ```
 
 > 🔑 **Generate secure tokens:** `python3 -c "import secrets; print(secrets.token_hex(32))"`
@@ -132,6 +146,20 @@ python3 scripts/agent_mesh_service.py
 ```bash
 bash scripts/start_agent_mesh.sh
 ```
+
+### Shared runtime for every configured agent
+
+Gemini/Antigravity, Codex, and OpenCode use one common bridge under
+`~/AI-Second-Brain/.agent_mesh/scripts/`. Install the runtime once after
+cloning; individual agents do not need separate orchestration settings:
+
+```bash
+bash scripts/deploy_shared_runtime.sh
+bash ~/AI-Second-Brain/.agent_mesh/scripts/start_agent_mesh.sh
+```
+
+Reload an already-open MCP session so it discovers the updated tools. Agents
+remain eligible for assignment only while they publish a current heartbeat.
 
 ### Option 3: systemd user service (persistent after login)
 
@@ -177,7 +205,6 @@ curl -s -X POST http://127.0.0.1:17860/agents/register \
   -d '{
     "name": "MyAgent",
     "provider": "Claude/Gemini/Local/etc",
-    "type": "assistant",
     "capabilities": {"code": true, "memory": true},
     "status": "active"
   }'
@@ -237,8 +264,17 @@ Add to your agent's MCP configuration:
 Available MCP tools:
 - `agent_mesh_health` — Check service health
 - `agent_mesh_list_agents` — List registered agents
+- `agent_mesh_list_capabilities` — Discover capability and workload metadata
 - `agent_mesh_send_message` — Send a message to an agent
 - `agent_mesh_create_handoff` — Create a task handoff request
+- `agent_mesh_create_orchestration_run` — Create an explicit task DAG
+- `agent_mesh_poll_tasks` — Deliver a real task to a worker agent
+- `agent_mesh_ack_task` — Acknowledge or reject a task request
+- `agent_mesh_task_progress` — Report progress and refresh the lease
+- `agent_mesh_submit_task_result` — Return a structured worker result
+- `agent_mesh_verify_task` — Accept or request a revision
+- `agent_mesh_finalize_run` — Store the lead's integrated final result
+- `agent_mesh_cancel_task` / `agent_mesh_cancel_run` — Cancel work safely
 - `obsidian_vault_status` — Check vault status
 - `obsidian_list_notes` — List all vault notes
 - `obsidian_read_note` — Read a specific note
@@ -400,6 +436,7 @@ python3 friday_web.py &
 | GET | `/health` | None | Service health and counts |
 | GET | `/agents` | Bearer | List all registered agents |
 | POST | `/agents/register` | Bearer | Register or update an agent |
+| GET | `/agents/{agent}/capabilities` | Bearer | Read capability and health metadata |
 | GET | `/messages/{agent}` | Bearer | Get messages for an agent |
 | POST | `/messages` | Bearer | Send a message |
 | POST | `/handoff` | Bearer | Create a handoff request |
@@ -410,6 +447,19 @@ python3 friday_web.py &
 | POST | `/tasks/{id}/heartbeat` | Bearer | Update task heartbeat |
 | POST | `/tasks/{id}/release` | Bearer | Release a task lease |
 | GET | `/tasks/stalled` | Bearer | Get stalled tasks |
+| GET | `/capabilities` | Bearer | Read the capability inventory |
+| POST | `/orchestration/runs` | Bearer | Create and dispatch an explicit task plan |
+| GET | `/orchestration/runs/{id}` | Bearer | Read run state, results, and trace events |
+| POST | `/orchestration/runs/{id}/advance` | Bearer | Reconcile and dispatch runnable tasks |
+| POST | `/orchestration/runs/{id}/finalize` | Bearer | Store the lead's integrated result |
+| POST | `/orchestration/runs/{id}/cancel` | Bearer | Cancel pending and active work |
+| POST | `/tasks/poll` | Bearer | Deliver and lease a request to a worker |
+| POST | `/tasks/{id}/ack` | Bearer | Accept or reject a task request |
+| POST | `/tasks/{id}/progress` | Bearer | Publish progress and refresh activity |
+| POST | `/tasks/{id}/result` | Bearer | Submit a structured worker result |
+| POST | `/tasks/{id}/error` | Bearer | Report failure and schedule recovery |
+| POST | `/tasks/{id}/verify` | Bearer | Accept or request a revision |
+| POST | `/tasks/{id}/cancel` | Bearer | Cancel one task and notify its worker |
 | POST | `/memory` | Bearer | Store a memory entry |
 | GET | `/memory/search?q=...` | Bearer | Search memory |
 | GET | `/skills` | Bearer | List all skills |
@@ -431,15 +481,21 @@ agent-obsidian-connection/
 ├── README_SETUP.md           # Quick setup overview
 ├── SECURITY.md               # Security guidelines
 ├── BACKUP_AND_RESTORE.md     # Backup and restore instructions
+├── ORCHESTRATION.md           # Durable task protocol and shared deployment
 │
 ├── scripts/
+│   ├── agent_mesh_core.py         # SQLite state machine and queue
 │   ├── agent_mesh_service.py     # Core HTTP server + SQLite backend
 │   ├── agent_mesh_mcp_stdio.py   # MCP stdio bridge for Agent Mesh
 │   ├── obsidian_vault_mcp_stdio.py  # MCP stdio bridge for Obsidian vault
 │   ├── friday_second_brain_bridge.py  # Friday ↔ Agent Mesh heartbeat bridge
 │   ├── start_agent_mesh.sh       # Start script
+│   ├── deploy_shared_runtime.sh   # One-time shared runtime deployment
 │   ├── autostart.sh              # Shell login auto-start hook
 │   └── agent_mesh.service        # systemd user service definition
+│
+├── tests/
+│   └── test_agent_mesh.py       # Regression, HTTP, migration, and MCP tests
 │
 └── vault-templates/
     ├── Operating_Rules.md        # Agent operating rules template

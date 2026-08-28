@@ -18,8 +18,9 @@ This system provides a local multi-agent coordination layer using:
 
 1. Open the Obsidian vault at `AI-Second-Brain-Vault`
 2. Read `00_System/Operating_Rules.md`
-3. Start the Agent Mesh service (if implemented)
-4. Have agents onboard via `CONNECT_NEW_AI_AGENT.md`
+3. Install the shared Agent Mesh runtime once with `bash scripts/deploy_shared_runtime.sh`
+4. Start the shared Agent Mesh service (if implemented)
+5. Have agents onboard via `CONNECT_NEW_AI_AGENT.md`; existing clients use the shared bridge
 
 ## Agent Mesh Endpoints
 
@@ -28,6 +29,8 @@ If the Agent Mesh service is implemented:
 - Register agent: `POST http://127.0.0.1:17860/agents/register`
 - Messages: `POST http://127.0.0.1:17860/messages`
 - Tasks: `POST http://127.0.0.1:17860/tasks`
+- Orchestration: `POST http://127.0.0.1:17860/orchestration/runs`
+- Worker queue: `POST http://127.0.0.1:17860/tasks/poll`
 
 ## MCP Endpoints
 

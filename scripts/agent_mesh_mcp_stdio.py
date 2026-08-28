@@ -1,9 +1,17 @@
 #!/usr/bin/env python3
+"""MCP stdio adapter for the Agent Mesh REST control plane.
+
+The adapter is intentionally a thin transport layer.  It exposes the durable
+task protocol to real agents; it does not fabricate worker responses.
+"""
+
 from __future__ import annotations
 
 import json
 import os
 import sys
+import urllib.error
+import urllib.parse
 import urllib.request
 from pathlib import Path
 
@@ -41,7 +49,6 @@ def read_message():
             key, value = line.decode(errors="replace").split(":", 1)
             headers[key.lower()] = value.strip()
         line = sys.stdin.buffer.readline()
-
     length = int(headers.get("content-length", "0"))
     if length <= 0:
         return None
@@ -66,56 +73,367 @@ def http(method: str, path: str, data=None):
     if auth_token:
         headers["Authorization"] = "Bearer " + auth_token
     body = json.dumps(data).encode() if data is not None else None
-    if body:
+    if body is not None:
         headers["Content-Type"] = "application/json"
     request = urllib.request.Request(BASE + path, data=body, headers=headers, method=method)
-    with urllib.request.urlopen(request, timeout=10) as response:
-        return json.loads(response.read().decode())
+    try:
+        with urllib.request.urlopen(request, timeout=15) as response:
+            raw = response.read().decode()
+            return json.loads(raw) if raw else {}
+    except urllib.error.HTTPError as exc:
+        raw = exc.read().decode(errors="replace")
+        try:
+            parsed = json.loads(raw)
+            detail = parsed.get("error") or parsed.get("detail") or str(exc)
+        except (ValueError, AttributeError):
+            detail = str(exc)
+        raise RuntimeError(str(detail)) from exc
+
+
+def schema(properties=None, required=None):
+    return {
+        "type": "object",
+        "properties": properties or {},
+        "required": required or [],
+        "additionalProperties": False,
+    }
 
 
 TOOLS = [
     {
         "name": "agent_mesh_health",
-        "description": "Check Agent Mesh health.",
-        "inputSchema": {"type": "object", "properties": {}, "additionalProperties": False},
+        "description": "Check local Agent Mesh health and durable queue counts.",
+        "inputSchema": schema(),
     },
     {
         "name": "agent_mesh_list_agents",
-        "description": "List registered Agent Mesh agents.",
-        "inputSchema": {"type": "object", "properties": {}, "additionalProperties": False},
+        "description": "Discover registered agents, capabilities, health, and workload.",
+        "inputSchema": schema(),
+    },
+    {
+        "name": "agent_mesh_get_agent",
+        "description": "Get one registered agent and its capability metadata.",
+        "inputSchema": schema({"agent": {"type": "string"}}, ["agent"]),
+    },
+    {
+        "name": "agent_mesh_list_capabilities",
+        "description": "List the capability registry used for agent selection.",
+        "inputSchema": schema(),
     },
     {
         "name": "agent_mesh_send_message",
-        "description": "Send a message through Agent Mesh.",
-        "inputSchema": {
-            "type": "object",
-            "properties": {
+        "description": "Persist a direct or protocol message for another agent.",
+        "inputSchema": schema(
+            {
                 "from_agent": {"type": "string"},
                 "to_agent": {"type": "string"},
                 "subject": {"type": "string"},
                 "body": {"type": "string"},
                 "task_id": {"type": "string"},
+                "message_type": {"type": "string"},
+                "payload": {"type": "object"},
+                "correlation_id": {"type": "string"},
+                "conversation_id": {"type": "string"},
+                "idempotency_key": {"type": "string"},
             },
-            "required": ["to_agent", "subject", "body"],
-            "additionalProperties": False,
-        },
+            ["to_agent", "subject"],
+        ),
     },
     {
         "name": "agent_mesh_create_handoff",
-        "description": "Create an Agent Mesh handoff request.",
-        "inputSchema": {
-            "type": "object",
-            "properties": {
+        "description": "Create a recorded handoff request.",
+        "inputSchema": schema(
+            {
                 "from_agent": {"type": "string"},
                 "to_agent": {"type": "string"},
                 "request": {"type": "string"},
                 "task_id": {"type": "string"},
             },
-            "required": ["from_agent", "to_agent", "request"],
-            "additionalProperties": False,
-        },
+            ["from_agent", "to_agent", "request"],
+        ),
+    },
+    {
+        "name": "agent_mesh_create_orchestration_run",
+        "description": "Create a lead-agent run from an explicit task plan and DAG.",
+        "inputSchema": schema(
+            {
+                "request": {"type": "string"},
+                "lead_agent": {"type": "string"},
+                "tasks": {"type": "array", "items": {"type": "object"}},
+                "plan": {"type": "object"},
+                "metadata": {"type": "object"},
+                "max_delegation_depth": {"type": "integer"},
+                "run_id": {"type": "string"},
+            },
+            ["request"],
+        ),
+    },
+    {
+        "name": "agent_mesh_get_run",
+        "description": "Read orchestration state, task results, and trace events.",
+        "inputSchema": schema({"run_id": {"type": "string"}}, ["run_id"]),
+    },
+    {
+        "name": "agent_mesh_advance_run",
+        "description": "Reconcile a run and dispatch runnable durable tasks.",
+        "inputSchema": schema({"run_id": {"type": "string"}}, ["run_id"]),
+    },
+    {
+        "name": "agent_mesh_cancel_run",
+        "description": "Cancel a run and propagate cancellation to pending work.",
+        "inputSchema": schema(
+            {"run_id": {"type": "string"}, "actor": {"type": "string"}},
+            ["run_id"],
+        ),
+    },
+    {
+        "name": "agent_mesh_finalize_run",
+        "description": "Store the lead agent's verified integrated result for a completed run.",
+        "inputSchema": schema(
+            {
+                "run_id": {"type": "string"},
+                "finalized_by": {"type": "string"},
+                "result": {"type": "object"},
+                "final_result": {"type": "object"},
+                "summary": {"type": "string"},
+            },
+            ["run_id"],
+        ),
+    },
+    {
+        "name": "agent_mesh_poll_tasks",
+        "description": "Poll and lease TASK_REQUEST messages addressed to this real worker agent.",
+        "inputSchema": schema(
+            {"agent": {"type": "string"}, "limit": {"type": "integer"}},
+            ["agent"],
+        ),
+    },
+    {
+        "name": "agent_mesh_get_task",
+        "description": "Read a task, context, dependencies, and current result.",
+        "inputSchema": schema({"task_id": {"type": "string"}}, ["task_id"]),
+    },
+    {
+        "name": "agent_mesh_get_tasks",
+        "description": "List durable tasks, optionally scoped to an orchestration run.",
+        "inputSchema": schema({"run_id": {"type": "string"}}),
+    },
+    {
+        "name": "agent_mesh_ack_task",
+        "description": "Acknowledge or reject a received TASK_REQUEST.",
+        "inputSchema": schema(
+            {
+                "task_id": {"type": "string"},
+                "agent": {"type": "string"},
+                "accepted": {"type": "boolean"},
+                "reason": {"type": "string"},
+                "message_id": {"type": "integer"},
+            },
+            ["task_id", "agent"],
+        ),
+    },
+    {
+        "name": "agent_mesh_task_progress",
+        "description": "Publish structured progress and refresh the task lease.",
+        "inputSchema": schema(
+            {
+                "task_id": {"type": "string"},
+                "agent": {"type": "string"},
+                "progress": {"type": "number"},
+                "summary": {"type": "string"},
+                "message": {"type": "string"},
+            },
+            ["task_id", "agent"],
+        ),
+    },
+    {
+        "name": "agent_mesh_submit_task_result",
+        "description": "Submit a structured worker result; lead-agent verification is still required.",
+        "inputSchema": schema(
+            {
+                "task_id": {"type": "string"},
+                "agent": {"type": "string"},
+                "result": {"type": "object"},
+                "idempotency_key": {"type": "string"},
+            },
+            ["task_id", "agent", "result"],
+        ),
+    },
+    {
+        "name": "agent_mesh_fail_task",
+        "description": "Report a task error and allow bounded retry/reassignment.",
+        "inputSchema": schema(
+            {
+                "task_id": {"type": "string"},
+                "agent": {"type": "string"},
+                "error": {"type": "object"},
+                "message": {"type": "string"},
+                "reassign": {"type": "boolean"},
+            },
+            ["task_id", "agent"],
+        ),
+    },
+    {
+        "name": "agent_mesh_verify_task",
+        "description": "Lead-agent verification gate for a submitted result.",
+        "inputSchema": schema(
+            {
+                "task_id": {"type": "string"},
+                "valid": {"type": "boolean"},
+                "verified_by": {"type": "string"},
+                "revision_instructions": {"type": "string"},
+                "expected": {},
+                "actual": {},
+                "retry": {"type": "boolean"},
+                "reassign": {"type": "boolean"},
+            },
+            ["task_id", "valid"],
+        ),
+    },
+    {
+        "name": "agent_mesh_heartbeat",
+        "description": "Publish worker health and keep the agent eligible for assignment.",
+        "inputSchema": schema(
+            {
+                "agent": {"type": "string"},
+                "status": {"type": "string"},
+                "health": {"type": "string"},
+            },
+            ["agent"],
+        ),
+    },
+    {
+        "name": "agent_mesh_task_heartbeat",
+        "description": "Refresh a running task heartbeat and execution lease.",
+        "inputSchema": schema(
+            {"task_id": {"type": "string"}, "agent": {"type": "string"}},
+            ["task_id", "agent"],
+        ),
+    },
+    {
+        "name": "agent_mesh_cancel_task",
+        "description": "Cancel one task and prevent further delivery.",
+        "inputSchema": schema(
+            {"task_id": {"type": "string"}, "actor": {"type": "string"}},
+            ["task_id"],
+        ),
+    },
+    {
+        "name": "agent_mesh_get_inbox",
+        "description": "Read messages addressed to an agent, including ACKs and results.",
+        "inputSchema": schema(
+            {"agent": {"type": "string"}, "status": {"type": "string"}},
+            ["agent"],
+        ),
     },
 ]
+
+
+def encoded(value) -> str:
+    return urllib.parse.quote(str(value), safe="")
+
+
+def call_tool(name: str, arguments: dict):
+    if name == "agent_mesh_health":
+        return http("GET", "/health")
+    if name == "agent_mesh_list_agents":
+        return http("GET", "/agents")
+    if name == "agent_mesh_get_agent":
+        return http("GET", "/agents/" + encoded(arguments["agent"]))
+    if name == "agent_mesh_list_capabilities":
+        return http("GET", "/capabilities")
+    if name == "agent_mesh_send_message":
+        return http("POST", "/messages", arguments)
+    if name == "agent_mesh_create_handoff":
+        return http("POST", "/handoff", arguments)
+    if name == "agent_mesh_create_orchestration_run":
+        return http("POST", "/orchestration/runs", arguments)
+    if name == "agent_mesh_get_run":
+        return http("GET", "/orchestration/runs/" + encoded(arguments["run_id"]))
+    if name == "agent_mesh_advance_run":
+        return http(
+            "POST",
+            "/orchestration/runs/" + encoded(arguments["run_id"]) + "/advance",
+            {},
+        )
+    if name == "agent_mesh_cancel_run":
+        return http(
+            "POST",
+            "/orchestration/runs/" + encoded(arguments["run_id"]) + "/cancel",
+            arguments,
+        )
+    if name == "agent_mesh_finalize_run":
+        return http(
+            "POST",
+            "/orchestration/runs/" + encoded(arguments["run_id"]) + "/finalize",
+            arguments,
+        )
+    if name == "agent_mesh_poll_tasks":
+        return http("POST", "/tasks/poll", arguments)
+    if name == "agent_mesh_get_task":
+        return http("GET", "/tasks/" + encoded(arguments["task_id"]))
+    if name == "agent_mesh_get_tasks":
+        suffix = ""
+        if arguments.get("run_id"):
+            suffix = "?run_id=" + encoded(arguments["run_id"])
+        return http("GET", "/tasks" + suffix)
+    if name == "agent_mesh_ack_task":
+        return http(
+            "POST",
+            "/tasks/" + encoded(arguments["task_id"]) + "/ack",
+            arguments,
+        )
+    if name == "agent_mesh_task_progress":
+        return http(
+            "POST",
+            "/tasks/" + encoded(arguments["task_id"]) + "/progress",
+            arguments,
+        )
+    if name == "agent_mesh_submit_task_result":
+        return http(
+            "POST",
+            "/tasks/" + encoded(arguments["task_id"]) + "/result",
+            arguments,
+        )
+    if name == "agent_mesh_fail_task":
+        return http(
+            "POST",
+            "/tasks/" + encoded(arguments["task_id"]) + "/error",
+            arguments,
+        )
+    if name == "agent_mesh_verify_task":
+        return http(
+            "POST",
+            "/tasks/" + encoded(arguments["task_id"]) + "/verify",
+            arguments,
+        )
+    if name == "agent_mesh_heartbeat":
+        return http(
+            "POST",
+            "/agents/" + encoded(arguments["agent"]) + "/heartbeat",
+            arguments,
+        )
+    if name == "agent_mesh_task_heartbeat":
+        return http(
+            "POST",
+            "/tasks/" + encoded(arguments["task_id"]) + "/heartbeat",
+            arguments,
+        )
+    if name == "agent_mesh_cancel_task":
+        return http(
+            "POST",
+            "/tasks/" + encoded(arguments["task_id"]) + "/cancel",
+            arguments,
+        )
+    if name == "agent_mesh_get_inbox":
+        suffix = ""
+        if arguments.get("status"):
+            suffix = "?status=" + encoded(arguments["status"])
+        return http(
+            "GET",
+            "/agents/" + encoded(arguments["agent"]) + "/inbox" + suffix,
+        )
+    raise ValueError(f"unknown tool: {name}")
 
 
 def initialize_result(request):
@@ -128,28 +446,13 @@ def initialize_result(request):
             "resources": {"subscribe": False, "listChanged": False},
             "prompts": {"listChanged": False},
         },
-        "serverInfo": {"name": "agent-mesh-stdio", "version": "1.0.1"},
+        "serverInfo": {"name": "agent-mesh-stdio", "version": "2.0.0"},
     }
-
-
-def call_tool(name: str, arguments: dict):
-    if name == "agent_mesh_health":
-        return http("GET", "/health")
-    if name == "agent_mesh_list_agents":
-        return http("GET", "/agents")
-    if name == "agent_mesh_send_message":
-        payload = dict(arguments)
-        payload.setdefault("from_agent", "mcp-client")
-        return http("POST", "/messages", payload)
-    if name == "agent_mesh_create_handoff":
-        return http("POST", "/handoff", arguments)
-    raise ValueError(f"unknown tool: {name}")
 
 
 def handle_request(request):
     method = request.get("method")
     params = request.get("params") or {}
-
     if method == "initialize":
         return initialize_result(request), False
     if method in {"notifications/initialized", "notifications/cancelled", "notifications/progress"}:

@@ -35,7 +35,20 @@ If you support MCP, configure these local stdio bridges:
 }
 ```
 
+On an existing AI Second Brain installation, the MCP clients already point to
+the shared bridge at `~/AI-Second-Brain/.agent_mesh/scripts/agent_mesh_mcp_stdio.py`.
+Do not create a separate per-agent task bus. The shared runtime is installed
+once with `scripts/deploy_shared_runtime.sh`; reload the MCP connection after a
+runtime update. Existing registered agents keep their metadata in the shared
+SQLite registry and only need a current heartbeat to receive work.
+
 If you cannot use MCP but can call localhost HTTP, use Agent Mesh REST at `http://127.0.0.1:17860` with the local token reference `${AGENT_MESH_TOKEN}`. Do not write token values into notes, logs, chat, or config examples.
+
+Workers receive real delegated work by polling `POST /tasks/poll`, then must
+send `TASK_ACK`, progress/heartbeats, and a structured `TASK_RESULT`. A task is
+not complete because it was merely sent. The lead agent verifies results and
+finalizes the integrated run. See `ORCHESTRATION.md` for the full protocol and
+recovery behavior.
 
 ## Introduction
 
