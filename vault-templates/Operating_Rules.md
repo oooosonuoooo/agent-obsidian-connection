@@ -2,12 +2,35 @@
 
 These rules govern all AI agents reading or writing to this second brain and interacting via Agent Mesh.
 
+## Autonomous Team Default
+
+For every substantive user objective, the agent receiving the request is the
+lead. Submit one `agent_mesh_start_autonomous_run` with the complete objective
+and workspace, then wait with `agent_mesh_wait_autonomous_run`. The shared
+supervisor consults specialists when useful, builds the task DAG, routes by
+capability, invokes real provider adapters, audits every result, retries or
+reassigns bounded failures, and integrates verified evidence.
+
+Return one final report only after the linked tasks are accepted and integrated.
+Never claim another agent worked without durable assignment, ACK/result, and
+verification evidence. If a provider has no invokable adapter, keep it as a
+cooperative worker and wait for its real MCP poll/ACK/result flow; never invent
+a response. This contract applies to research, design, writing, coding,
+testing, security, data, deployment, and operations.
+
+All agents share one federated MCP-tool and skill catalog. Use the shared
+catalog tools to discover capabilities from other agents, then request them in
+an autonomous task with `required_tools` or `required_skills`. Execution stays
+with the authorized owner agent; never copy credentials or assume another
+agent's permissions.
+
 ## Agent Workflow
 When any agent receives a task:
 1. **Use the Second Brain by Default**: Obsidian and Agent Mesh are always part of the task context. The user does not need to mention them.
 2. **Search First**: Search Obsidian and Agent Mesh first. Do not duplicate existing work or tasks.
 3. **Create/Update Task Note**: Create or update one task note in `04_Tasks/` using the template `04_Tasks/_Task_Template.md`.
-4. **Work Independently**: Work independently first.
+4. **Lead or Worker**: Leads use the autonomous run tools. Workers poll the
+   durable queue, ACK, execute, heartbeat, and submit structured results.
 5. **Handoff / Help Request**: If blocked after two serious attempts, create a help request.
 6. **Help Request Format**: The help request must include:
    - Goal

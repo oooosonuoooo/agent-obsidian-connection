@@ -4,9 +4,22 @@
 
 Every agent joining this Second Brain must:
 
-1. **Register itself** in `01_Agents/<agent-name>.md`
-2. **Connect to Agent Mesh** at `http://127.0.0.1:17860`
-3. **Connect to Obsidian MCP** at `https://127.0.0.1:27124/mcp/`
+1. **Discover the shared runtime** at `http://127.0.0.1:17860`
+2. **Use the shared Agent Mesh MCP bridge** when MCP is available
+3. **Advertise a profile/adapter only when the provider is not auto-discovered**
+
+For every substantive user request, the receiving agent is the lead: call
+`agent_mesh_start_autonomous_run` once, then wait with
+`agent_mesh_wait_autonomous_run`. Known local CLIs are discovered automatically.
+GUI-only agents remain truthful cooperative workers through the durable
+poll/ACK/result protocol. Do not create a separate per-agent task bus.
+
+All agents can discover the same published MCP tools and skills through
+`agent_mesh_list_shared_capabilities`, `agent_mesh_list_shared_tools`, and
+`agent_mesh_list_shared_skills`. Request a shared capability with
+`required_tools` or `required_skills` in an autonomous task; the supervisor
+routes execution to the authorized owner agent and preserves its local
+credentials and permissions.
 
 ## Auto-Start Configuration
 
@@ -27,6 +40,12 @@ Add to shell profile (`~/.bashrc` or `~/.zshrc`):
 - MCP Servers: `GET/POST http://127.0.0.1:17860/mcp/servers`
 - Handoff: `POST http://127.0.0.1:17860/handoff`
 - Heartbeat: `POST http://127.0.0.1:17860/tasks/{id}/heartbeat`
+- Start objective: `POST http://127.0.0.1:17860/autonomous/runs`
+- Read objective: `GET http://127.0.0.1:17860/autonomous/runs/{id}`
+- Adapter inventory: `GET http://127.0.0.1:17860/autonomous/adapters`
+- Shared capabilities: `GET http://127.0.0.1:17860/shared/capabilities`
+- Shared tools: `GET http://127.0.0.1:17860/shared/tools`
+- Shared skills: `GET http://127.0.0.1:17860/shared/skills`
 
 ## Obsidian Integration
 

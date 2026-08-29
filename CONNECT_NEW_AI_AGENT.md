@@ -4,17 +4,40 @@ This document provides instructions for connecting new AI agents to the AI Secon
 
 ## Non-Negotiable Default Behavior
 
-You must use the AI Second Brain automatically for every non-trivial task. The user should not need to mention Obsidian, the vault, Agent Mesh, memory, handoffs, or resume packets in each prompt.
+You must use the AI Second Brain automatically for every non-trivial task. The
+user should not need to mention Obsidian, the vault, Agent Mesh, memory,
+handoffs, or resume packets in each prompt.
+
+For every substantive objective, the agent receiving the user request is the
+lead. Start one `agent_mesh_start_autonomous_run` with the complete objective
+and workspace, then wait with `agent_mesh_wait_autonomous_run`. The shared
+supervisor decides whether to consult specialists, creates the DAG, routes
+tasks by capability, invokes real provider adapters, audits/revises results,
+and integrates the verified evidence. Return the supervisor's final report
+only after the linked tasks are accepted and integrated. A simple local task
+may stay in the current session when delegation adds no value, but it still
+uses the shared memory and truthful reporting rules.
+
+Never claim that another agent worked unless the durable autonomous run has
+real task assignment, ACK/result, and verification evidence. If a provider is
+not invokable, leave it as a cooperative worker and report `WAITING` until that
+agent polls and submits its real result; do not manufacture a response.
 
 Before starting work:
 
-1. Read `README_SETUP.md`, `SECURITY.md`, and `AI-Second-Brain-Vault/00_System/Operating_Rules.md`.
+1. Read `README_SETUP.md`, `SECURITY.md`, and the active `Operating_Rules.md` in the vault system directory.
 2. Check Agent Mesh at `http://127.0.0.1:17860/health`.
 3. Use the local Obsidian vault at `~/AI-Second-Brain/AI-Second-Brain-Vault`.
 4. Register or refresh your agent profile in `AI-Second-Brain-Vault/01_Agents/`.
 5. Search existing task notes and Agent Mesh before creating new work.
-6. Record durable task context in `04_Tasks/`, durable memory in `03_Memory/`, decisions in `05_Decisions/`, and repair/status reports in `08_Inbox/`.
-7. If you stop, crash, lose context, or hand off work, update the task note and resume packet first.
+6. Discover shared tools and skills with `agent_mesh_list_shared_capabilities`.
+7. Record durable task context in `04_Tasks/`, durable memory in `03_Memory/`, decisions in `05_Decisions/`, and repair/status reports in `08_Inbox/`.
+8. If you stop, crash, lose context, or hand off work, update the task note and resume packet first.
+
+As a lead, do not manually split a substantive request into untracked chats;
+use the autonomous run tools above. As a worker, poll the durable queue, ACK
+the task, report progress/heartbeats, perform the assigned work, and submit the
+structured result. A task is complete only after independent verification.
 
 If you support MCP, configure these local stdio bridges:
 
@@ -35,20 +58,62 @@ If you support MCP, configure these local stdio bridges:
 }
 ```
 
-On an existing AI Second Brain installation, the MCP clients already point to
-the shared bridge at `~/AI-Second-Brain/.agent_mesh/scripts/agent_mesh_mcp_stdio.py`.
-Do not create a separate per-agent task bus. The shared runtime is installed
-once with `scripts/deploy_shared_runtime.sh`; reload the MCP connection after a
-runtime update. Existing registered agents keep their metadata in the shared
-SQLite registry and only need a current heartbeat to receive work.
+Shared tool and skill access is federated through the same Agent Mesh bridge.
+Do not copy another agent's credentials or private configuration. Request a
+published capability in an autonomous task with `required_tools` or
+`required_skills`; the authorized owner agent executes it and returns durable
+evidence for audit.
+
+On an existing AI Second Brain installation, Gemini/Antigravity, Codex,
+OpenCode, Kilo, Cursor, Windsurf/Cascade, and Kiro can all use the shared
+bridge at `~/AI-Second-Brain/.agent_mesh/scripts/agent_mesh_mcp_stdio.py`.
+Do not create a separate per-agent task bus or duplicate orchestration config.
+The shared runtime is installed once with
+`scripts/deploy_shared_runtime.sh`; this also bootstraps the shared MCP/skill
+catalog from the canonical vault registries. Reload the MCP connection after a
+runtime update. Existing registered agents keep their metadata in the shared SQLite
+registry and only need a current heartbeat to receive work. The caller may set
+`AGENT_MESH_AGENT_NAME` for a stable identity, but the autonomous tool also
+accepts `lead_agent` and defaults safely to `orchestrator` when omitted.
+
+The supervisor automatically discovers installed Gemini, Codex, Kilo, OpenCode,
+Claude/FCC, and Friday command adapters. GUI-only agents such as an IDE-hosted
+Codex session remain supported as cooperative MCP workers; no unsafe generic
+CLI wrapper is assumed for them. Inspect the non-secret inventory with
+`agent_mesh_list_adapters`. Register only providers without a built-in profile,
+and register them once for the shared team.
+
+`agent_mesh_list_agents` reports `autonomy_ready=true` for a real adapter that
+the supervisor can launch on demand. A cooperative GUI agent is `online` only
+while its client publishes a heartbeat; another agent cannot honestly fake
+that session, but it can queue work and wait for the client to claim it.
 
 If you cannot use MCP but can call localhost HTTP, use Agent Mesh REST at `http://127.0.0.1:17860` with the local token reference `${AGENT_MESH_TOKEN}`. Do not write token values into notes, logs, chat, or config examples.
 
 Workers receive real delegated work by polling `POST /tasks/poll`, then must
 send `TASK_ACK`, progress/heartbeats, and a structured `TASK_RESULT`. A task is
 not complete because it was merely sent. The lead agent verifies results and
-finalizes the integrated run. See `ORCHESTRATION.md` for the full protocol and
-recovery behavior.
+the supervisor finalizes the integrated run. See `ORCHESTRATION.md` for the
+full protocol, recovery behavior, adapter registration, and autonomous API.
+
+## Autonomous Team Contract
+
+The shared runtime is the default team coordinator, not an optional message
+log. For a substantive user request, the current agent is the lead and must:
+
+1. Read enough shared context to understand the objective and workspace.
+2. Call `agent_mesh_start_autonomous_run` once with the complete objective.
+3. Let the supervisor consult specialists, plan the DAG, dispatch real
+   adapters, audit results, retry/reassign failures, and integrate evidence.
+4. Wait with `agent_mesh_wait_autonomous_run` until `COMPLETED` or a genuine
+   `WAITING`/`BLOCKED` condition.
+5. Return the verified final report, including any warnings or unresolved
+   blockers. Do not claim work that is absent from the linked run.
+
+If the agent is assigned a task instead, it is a worker: poll, ACK, execute,
+heartbeat, submit a structured result, and wait for verification. This same
+contract covers research, writing, design, coding, testing, security, data,
+deployment, and operations.
 
 ## Introduction
 
@@ -1168,6 +1233,14 @@ A single prompt can only connect an agent if that agent has:
 3. Ask a local agent to assist with setup
 
 ### About Account Login and Browser Permissions
+
+The universal autonomous lead/worker contract at the top of this guide applies
+to every agent and every work domain. Use that contract for substantive work:
+start one autonomous run, wait for its verified report, or act as a durable
+worker by polling, ACKing, executing, heartbeating, and submitting results.
+The historical checklist below is only for local profile and connection setup;
+it must not replace the autonomous run protocol or be used to claim work that
+has no durable evidence.
 
 If any integration requires account permission, OAuth login, or authorization:
 

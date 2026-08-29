@@ -14,6 +14,7 @@ import os
 import re
 import sqlite3
 import uuid
+import urllib.parse
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -54,6 +55,28 @@ MESSAGE_TYPES = frozenset(
     }
 )
 RUN_TERMINAL = frozenset({"COMPLETED", "FAILED", "CANCELLED", "PARTIALLY_FAILED"})
+AUTONOMOUS_STATES = frozenset(
+    {
+        "QUEUED",
+        "ANALYZING",
+        "CONSULTING",
+        "PLANNING",
+        "DELEGATING",
+        "RUNNING",
+        "COLLECTING",
+        "AUDITING",
+        "REVISING",
+        "INTEGRATING",
+        "FINALIZING",
+        "WAITING",
+        "COMPLETED",
+        "FAILED",
+        "PARTIALLY_FAILED",
+        "BLOCKED",
+        "CANCELLED",
+    }
+)
+AUTONOMOUS_TERMINAL = frozenset({"COMPLETED", "FAILED", "BLOCKED", "CANCELLED"})
 
 
 class MeshError(Exception):
@@ -92,6 +115,11 @@ class Settings:
     max_delegation_depth: int
     reaper_interval: float
     max_body_bytes: int
+    autonomy_enabled: bool = True
+    autonomy_interval: float = 1.0
+    autonomy_max_workers: int = 4
+    autonomy_max_rounds: int = 3
+    autonomy_command_timeout: float = 1800.0
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -137,6 +165,14 @@ class Settings:
             max_delegation_depth=integer("MAX_DELEGATION_DEPTH", 3, 0),
             reaper_interval=number("AGENT_MESH_REAPER_INTERVAL", 1.0, 0.05),
             max_body_bytes=integer("AGENT_MESH_MAX_BODY_BYTES", 2 * 1024 * 1024, 4096),
+            autonomy_enabled=os.environ.get("AGENT_MESH_AUTONOMY_ENABLED", "1").lower()
+            not in {"0", "false", "no", "off"},
+            autonomy_interval=number("AGENT_MESH_AUTONOMY_INTERVAL", 1.0, 0.1),
+            autonomy_max_workers=integer("AGENT_MESH_AUTONOMY_MAX_WORKERS", 4, 1),
+            autonomy_max_rounds=integer("AGENT_MESH_AUTONOMY_MAX_ROUNDS", 3, 1),
+            autonomy_command_timeout=number(
+                "AGENT_MESH_AUTONOMY_COMMAND_TIMEOUT", 1800.0, 1.0
+            ),
         )
 
 
@@ -244,6 +280,25 @@ def json_value(value: Any, default: Any) -> Any:
         return json.loads(value)
     except (TypeError, ValueError):
         return default
+
+
+def public_endpoint(value: Any) -> str:
+    """Return an endpoint location without query or fragment credentials."""
+    endpoint = redact_text(value or "")
+    if not endpoint:
+        return ""
+    try:
+        parsed = urllib.parse.urlsplit(endpoint)
+        if parsed.scheme and parsed.netloc:
+            host = parsed.hostname or ""
+            if ":" in host and not host.startswith("["):
+                host = "[" + host + "]"
+            if parsed.port:
+                host += ":" + str(parsed.port)
+            return urllib.parse.urlunsplit((parsed.scheme, host, parsed.path, "", ""))
+    except ValueError:
+        pass
+    return endpoint.split("?", 1)[0].split("#", 1)[0]
 
 
 def nonempty_text(value: Any, field: str, maximum: int = 20000) -> str:
@@ -372,6 +427,8 @@ class MeshStore:
                     description TEXT,
                     assigned_agent TEXT,
                     required_capabilities_json TEXT NOT NULL DEFAULT '[]',
+                    required_tools_json TEXT NOT NULL DEFAULT '[]',
+                    required_skills_json TEXT NOT NULL DEFAULT '[]',
                     dependencies_json TEXT NOT NULL DEFAULT '[]',
                     artifact_paths_json TEXT NOT NULL DEFAULT '[]',
                     candidate_agents_json TEXT NOT NULL DEFAULT '[]',
@@ -507,6 +564,27 @@ class MeshStore:
                     acquired_at TEXT NOT NULL,
                     released_at TEXT
                 );
+                CREATE TABLE IF NOT EXISTS autonomous_requests (
+                    id TEXT PRIMARY KEY,
+                    objective TEXT NOT NULL,
+                    lead_agent TEXT NOT NULL,
+                    workspace TEXT NOT NULL,
+                    state TEXT NOT NULL DEFAULT 'QUEUED',
+                    orchestration_run_id TEXT,
+                    planner_agent TEXT,
+                    auditor_agent TEXT,
+                    integrator_agent TEXT,
+                    max_rounds INTEGER NOT NULL DEFAULT 3,
+                    round INTEGER NOT NULL DEFAULT 0,
+                    idempotency_key TEXT UNIQUE,
+                    request_json TEXT NOT NULL DEFAULT '{}',
+                    consultation_json TEXT NOT NULL DEFAULT '[]',
+                    report_json TEXT,
+                    error_json TEXT,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    completed_at TEXT
+                );
                 """
             )
 
@@ -559,6 +637,8 @@ class MeshStore:
                     "description": "TEXT",
                     "assigned_agent": "TEXT",
                     "required_capabilities_json": "TEXT NOT NULL DEFAULT '[]'",
+                    "required_tools_json": "TEXT NOT NULL DEFAULT '[]'",
+                    "required_skills_json": "TEXT NOT NULL DEFAULT '[]'",
                     "dependencies_json": "TEXT NOT NULL DEFAULT '[]'",
                     "artifact_paths_json": "TEXT NOT NULL DEFAULT '[]'",
                     "candidate_agents_json": "TEXT NOT NULL DEFAULT '[]'",
@@ -620,8 +700,16 @@ class MeshStore:
                 "WHERE task_key IS NULL OR task_key = ''"
             )
             database.execute(
-                "UPDATE tasks SET required_capabilities_json = '[]' "
+            "UPDATE tasks SET required_capabilities_json = '[]' "
                 "WHERE required_capabilities_json IS NULL OR required_capabilities_json = ''"
+            )
+            database.execute(
+                "UPDATE tasks SET required_tools_json = '[]' "
+                "WHERE required_tools_json IS NULL OR required_tools_json = ''"
+            )
+            database.execute(
+                "UPDATE tasks SET required_skills_json = '[]' "
+                "WHERE required_skills_json IS NULL OR required_skills_json = ''"
             )
             database.execute(
                 "UPDATE tasks SET dependencies_json = '[]' "
@@ -658,6 +746,23 @@ class MeshStore:
             database.execute(
                 "CREATE INDEX IF NOT EXISTS idx_events_run_created "
                 "ON orchestration_events(run_id, created_at)"
+            )
+            database.execute(
+                "CREATE INDEX IF NOT EXISTS idx_autonomous_state_updated "
+                "ON autonomous_requests(state, updated_at)"
+            )
+            self._add_missing_columns(
+                database,
+                "autonomous_requests",
+                {
+                    "idempotency_key": "TEXT",
+                    "consultation_json": "TEXT NOT NULL DEFAULT '[]'",
+                },
+            )
+            database.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS idx_autonomous_idempotency "
+                "ON autonomous_requests(idempotency_key) "
+                "WHERE idempotency_key IS NOT NULL"
             )
 
     @staticmethod
@@ -835,6 +940,20 @@ class MeshStore:
         declared = str(agent.get("health") or "").lower()
         if status in {"offline", "disabled", "unavailable"}:
             return "offline"
+        metadata = agent.get("metadata")
+        if not isinstance(metadata, dict):
+            metadata = json_value(agent.get("metadata_json"), {})
+        autonomy = metadata.get("autonomy") if isinstance(metadata, dict) else None
+        adapter_ready = isinstance(autonomy, dict) and autonomy.get("available") is True
+        if adapter_ready:
+            if status == "busy" or declared == "busy":
+                return "busy"
+            if declared == "degraded" or status == "degraded":
+                return "degraded"
+            # A supervisor-owned adapter is callable without a long-lived GUI
+            # heartbeat.  Keep it online for routing while exposing the
+            # separate autonomy_ready field to clients.
+            return "online"
         seen = parse_time(agent.get("last_seen_at"))
         at = at or datetime.now(timezone.utc)
         if seen is None or (at - seen).total_seconds() > self.settings.heartbeat_timeout:
@@ -848,10 +967,48 @@ class MeshStore:
     def register_agent(self, data: dict[str, Any]) -> dict[str, Any]:
         name = nonempty_text(data.get("name"), "name", 200)
         stamp = utc_now()
-        capabilities = data.get("capabilities")
-        if capabilities is None:
-            capabilities = data.get("capabilities_json", {})
         with self.transaction() as database:
+            existing = database.execute(
+                "SELECT * FROM agents WHERE name=?", (name,)
+            ).fetchone()
+            existing_data = dict(existing) if existing is not None else {}
+            capabilities = data.get("capabilities")
+            if capabilities is None and "capabilities_json" in data:
+                capabilities = data.get("capabilities_json")
+            if capabilities is None:
+                capabilities = json_value(existing_data.get("capabilities_json"), {})
+            if "metadata" in data:
+                metadata = data.get("metadata")
+            elif "metadata_json" in data:
+                metadata = data.get("metadata_json")
+            else:
+                metadata = json_value(existing_data.get("metadata_json"), {})
+            if not isinstance(metadata, dict):
+                metadata = {}
+            else:
+                metadata = dict(metadata)
+            if data.get("autonomy_adapter") is not None:
+                metadata["autonomy_adapter"] = data.get("autonomy_adapter")
+            for shared_key in ("tools", "skills", "mcp_servers"):
+                if shared_key in data and data.get(shared_key) is not None:
+                    metadata[shared_key] = sanitize(data.get(shared_key))
+            provider = data.get("provider") or existing_data.get("provider") or ""
+            agent_type = data.get("type") or existing_data.get("type") or "worker"
+            limitations = data.get("limitations")
+            if limitations is None:
+                limitations = existing_data.get("limitations") or ""
+            endpoint = data.get("endpoint")
+            if endpoint is None:
+                endpoint = existing_data.get("endpoint") or ""
+            model = data.get("model")
+            if model is None:
+                model = existing_data.get("model") or ""
+            max_concurrent = data.get("max_concurrent_tasks")
+            if max_concurrent is None:
+                max_concurrent = existing_data.get("max_concurrent_tasks") or 1
+            heartbeat_interval = data.get("heartbeat_interval_seconds")
+            if heartbeat_interval is None:
+                heartbeat_interval = existing_data.get("heartbeat_interval_seconds") or 30
             database.execute(
                 """
                 INSERT INTO agents
@@ -875,19 +1032,19 @@ class MeshStore:
                 """,
                 (
                     name,
-                    redact_text(data.get("provider") or ""),
-                    redact_text(data.get("type") or ""),
+                    redact_text(provider),
+                    redact_text(agent_type),
                     json_text(capabilities, {}),
-                    redact_text(data.get("limitations") or ""),
+                    redact_text(limitations),
                     redact_text(data.get("status") or "active"),
                     stamp,
                     stamp,
-                    redact_text(data.get("endpoint") or ""),
-                    redact_text(data.get("model") or ""),
-                    max(int(data.get("max_concurrent_tasks", 1)), 1),
+                    redact_text(endpoint),
+                    redact_text(model),
+                    max(int(max_concurrent), 1),
                     redact_text(data.get("health") or "online"),
-                    json_text(data.get("metadata") or data.get("metadata_json"), {}),
-                    max(int(data.get("heartbeat_interval_seconds", 30)), 1),
+                    json_text(metadata, {}),
+                    max(int(heartbeat_interval), 1),
                 ),
             )
             row = self._dict(database.execute("SELECT * FROM agents WHERE name=?", (name,)).fetchone())
@@ -940,6 +1097,15 @@ class MeshStore:
             assert agent is not None
             agent["health"] = self.agent_health(agent)
             agent["active_task_count"] = int(loads.get(agent["name"], 0))
+            agent["capabilities"] = json_value(agent.get("capabilities_json"), {})
+            agent["metadata"] = json_value(agent.get("metadata_json"), {})
+            agent["tools"] = agent["metadata"].get("tools", [])
+            agent["skills"] = agent["metadata"].get("skills", [])
+            agent["mcp_servers"] = agent["metadata"].get("mcp_servers", [])
+            autonomy = agent["metadata"].get("autonomy")
+            agent["autonomy_ready"] = bool(
+                isinstance(autonomy, dict) and autonomy.get("available") is True
+            )
             result.append(agent)
         return result
 
@@ -948,6 +1114,13 @@ class MeshStore:
         result["health"] = self.agent_health(result)
         result["capabilities"] = json_value(result.get("capabilities_json"), {})
         result["metadata"] = json_value(result.get("metadata_json"), {})
+        result["tools"] = result["metadata"].get("tools", [])
+        result["skills"] = result["metadata"].get("skills", [])
+        result["mcp_servers"] = result["metadata"].get("mcp_servers", [])
+        autonomy = result["metadata"].get("autonomy")
+        result["autonomy_ready"] = bool(
+            isinstance(autonomy, dict) and autonomy.get("available") is True
+        )
         with self.connect() as database:
             result["active_task_count"] = database.execute(
                 """
@@ -957,6 +1130,221 @@ class MeshStore:
                 (result["name"],),
             ).fetchone()[0]
         return result
+
+    def list_shared_mcp_servers(self, limit: int = 1000) -> list[dict[str, Any]]:
+        """List MCP providers without exposing credential-bearing URLs."""
+        bounded = max(min(int(limit), 5000), 1)
+        with self.connect() as database:
+            rows = [
+                dict(row)
+                for row in database.execute(
+                    "SELECT * FROM mcp_servers ORDER BY name LIMIT ?", (bounded,)
+                )
+            ]
+        result: list[dict[str, Any]] = []
+        for row in rows:
+            tools = json_value(row.get("tools_json"), [])
+            safety = json_value(row.get("safety_limits"), {})
+            result.append(
+                {
+                    "name": row.get("name"),
+                    "owner_agent": row.get("owner_agent") or "shared",
+                    "endpoint": public_endpoint(row.get("endpoint")),
+                    "transport": row.get("transport") or "",
+                    "auth_configured": bool(row.get("auth_ref")),
+                    "tools": sanitize(tools if isinstance(tools, list) else []),
+                    "safety_limits": sanitize(safety if isinstance(safety, dict) else {}),
+                    "status": row.get("status") or "unverified",
+                    "last_verified_at": row.get("last_verified_at") or "",
+                }
+            )
+        return result
+
+    def register_shared_skill(self, data: dict[str, Any]) -> dict[str, Any]:
+        """Upsert a skill and return only its safe federated representation."""
+        name = nonempty_text(data.get("name"), "skill name", 500)
+        owner = redact_text(data.get("owner_agent") or "")
+        with self.transaction() as database:
+            now = utc_now()
+            database.execute(
+                """
+                INSERT INTO skills
+                (name, owner_agent, skill_type, input_format, output_format,
+                 invocation_method, limitations, status, last_verified_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(name, owner_agent) DO UPDATE SET
+                    skill_type=excluded.skill_type,
+                    input_format=excluded.input_format,
+                    output_format=excluded.output_format,
+                    invocation_method=excluded.invocation_method,
+                    limitations=excluded.limitations,
+                    status=excluded.status,
+                    last_verified_at=excluded.last_verified_at
+                """,
+                (
+                    name,
+                    owner,
+                    redact_text(data.get("skill_type") or ""),
+                    redact_text(data.get("input_format") or ""),
+                    redact_text(data.get("output_format") or ""),
+                    redact_text(data.get("invocation_method") or ""),
+                    redact_text(data.get("limitations") or ""),
+                    redact_text(data.get("status") or "active"),
+                    redact_text(data.get("last_verified_at") or now),
+                ),
+            )
+        return next(
+            item
+            for item in self.list_shared_skills()
+            if item.get("name") == name
+            and item.get("owner_agent", "") == (owner or "shared")
+        )
+
+    def register_shared_mcp_server(self, data: dict[str, Any]) -> dict[str, Any]:
+        """Upsert an MCP provider and return a credential-safe representation."""
+        name = nonempty_text(data.get("name"), "MCP server name", 500)
+        tools = data.get("tools")
+        if tools is None:
+            tools = json_value(data.get("tools_json"), [])
+        if not isinstance(tools, list):
+            raise MeshError("tools must be a list")
+        safety_limits = data.get("safety_limits")
+        if not isinstance(safety_limits, dict):
+            safety_limits = json_value(safety_limits, {})
+        if not isinstance(safety_limits, dict):
+            safety_limits = {}
+        with self.transaction() as database:
+            now = utc_now()
+            database.execute(
+                """
+                INSERT INTO mcp_servers
+                (name, owner_agent, endpoint, transport, auth_ref, tools_json,
+                 safety_limits, status, last_verified_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(name) DO UPDATE SET
+                    owner_agent=excluded.owner_agent,
+                    endpoint=excluded.endpoint,
+                    transport=excluded.transport,
+                    auth_ref=excluded.auth_ref,
+                    tools_json=excluded.tools_json,
+                    safety_limits=excluded.safety_limits,
+                    status=excluded.status,
+                    last_verified_at=excluded.last_verified_at
+                """,
+                (
+                    name,
+                    redact_text(data.get("owner_agent") or ""),
+                    redact_text(data.get("endpoint") or ""),
+                    redact_text(data.get("transport") or ""),
+                    redact_text(data.get("auth_ref") or ""),
+                    json_text(tools, []),
+                    json_text(safety_limits, {}),
+                    redact_text(data.get("status") or "active"),
+                    redact_text(data.get("last_verified_at") or now),
+                ),
+            )
+        return next(
+            item for item in self.list_shared_mcp_servers() if item.get("name") == name
+        )
+
+    def list_shared_skills(self, limit: int = 1000) -> list[dict[str, Any]]:
+        """List skills published by agents in the shared registry."""
+        bounded = max(min(int(limit), 5000), 1)
+        with self.connect() as database:
+            rows = [
+                dict(row)
+                for row in database.execute(
+                    "SELECT * FROM skills ORDER BY name, owner_agent LIMIT ?", (bounded,)
+                )
+            ]
+        return [
+            {
+                "name": row.get("name"),
+                "owner_agent": row.get("owner_agent") or "shared",
+                "skill_type": row.get("skill_type") or "",
+                "input_format": row.get("input_format") or "",
+                "output_format": row.get("output_format") or "",
+                "invocation_method": row.get("invocation_method") or "",
+                "limitations": redact_text(row.get("limitations") or ""),
+                "status": row.get("status") or "unverified",
+                "last_verified_at": row.get("last_verified_at") or "",
+            }
+            for row in rows
+        ]
+
+    def shared_capability_catalog(self, limit: int = 1000) -> dict[str, Any]:
+        """Return the federated, permission-preserving capability catalog."""
+        mcp_servers = self.list_shared_mcp_servers(limit)
+        skills = self.list_shared_skills(limit)
+        tools: list[dict[str, Any]] = []
+        seen_tools: set[str] = set()
+
+        def add_tool(value: Any, *, server: str, owner: str) -> None:
+            if isinstance(value, dict):
+                name = value.get("name") or value.get("tool") or value.get("id")
+                entry = sanitize(value)
+            else:
+                name = value
+                entry = {"name": name}
+            if not isinstance(name, str) or not name.strip():
+                return
+            key = f"{owner}:{server}:{name}".lower()
+            if key in seen_tools:
+                return
+            seen_tools.add(key)
+            entry = dict(entry) if isinstance(entry, dict) else {"name": name}
+            entry.update(
+                {
+                    "name": name,
+                    "server": server,
+                    "owner_agent": owner,
+                }
+            )
+            tools.append(sanitize(entry))
+
+        for server in mcp_servers:
+            server_name = str(server.get("name") or "")
+            owner = str(server.get("owner_agent") or "shared")
+            published = server.get("tools") or []
+            for tool in published if isinstance(published, list) else []:
+                add_tool(tool, server=server_name, owner=owner)
+
+        agents = []
+        for agent in self.list_agents():
+            metadata = agent.get("metadata")
+            if not isinstance(metadata, dict):
+                metadata = {}
+            declared_tools = metadata.get("tools", [])
+            declared_skills = metadata.get("skills", [])
+            declared_servers = metadata.get("mcp_servers", [])
+            owner = str(agent.get("name") or "")
+            for tool in declared_tools if isinstance(declared_tools, list) else []:
+                add_tool(tool, server="agent-declared", owner=owner)
+            agents.append(
+                {
+                    "name": agent.get("name"),
+                    "provider": agent.get("provider"),
+                    "model": agent.get("model"),
+                    "type": agent.get("type"),
+                    "health": agent.get("health"),
+                    "autonomy_ready": agent.get("autonomy_ready", False),
+                    "capabilities": sanitize(agent.get("capabilities", {})),
+                    "tools": sanitize(declared_tools),
+                    "skills": sanitize(declared_skills),
+                    "mcp_servers": sanitize(declared_servers),
+                    "active_task_count": agent.get("active_task_count", 0),
+                }
+            )
+        return {
+            "agents": agents,
+            "mcp_servers": mcp_servers,
+            "tools": tools,
+            "skills": skills,
+            "usage": {
+                "routing": "Start an autonomous run with required_tools or required_skills; the supervisor routes to the authorized owner.",
+                "permissions": "Tool and skill access remains owned by the publishing agent; credentials are never copied into another client.",
+            },
+        }
 
     def _resolve_task_id(
         self, database: sqlite3.Connection, reference: Any, required: bool = True
@@ -979,6 +1367,8 @@ class MeshStore:
         result = dict(task)
         mappings = {
             "required_capabilities_json": "required_capabilities",
+            "required_tools_json": "required_tools",
+            "required_skills_json": "required_skills",
             "dependencies_json": "dependencies",
             "artifact_paths_json": "artifact_paths",
             "candidate_agents_json": "candidate_agents",
@@ -1163,6 +1553,8 @@ class MeshStore:
         description: str | None = None,
         assigned_agent: str | None = None,
         required_capabilities: Any = None,
+        required_tools: Any = None,
+        required_skills: Any = None,
         dependencies: Any = None,
         artifact_paths: Any = None,
         candidate_agents: Any = None,
@@ -1194,13 +1586,14 @@ class MeshStore:
             (title, owner_agent, status, priority, project, context_path, result_path,
              created_at, updated_at, task_key, run_id, parent_task_id, created_by,
              lead_agent, description, assigned_agent, required_capabilities_json,
-             dependencies_json, artifact_paths_json, candidate_agents_json, task_type,
+             required_tools_json, required_skills_json, dependencies_json,
+             artifact_paths_json, candidate_agents_json, task_type,
              input_json, acceptance_criteria, interfaces_json, constraints, attempt,
              max_retries, ack_timeout_seconds, execution_timeout_seconds,
              retry_backoff_seconds, idempotency_key, correlation_id, conversation_id,
              reassign_on_retry, delegation_depth)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-                    ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 nonempty_text(title, "title", 500),
@@ -1220,6 +1613,8 @@ class MeshStore:
                 redact_text(description or ""),
                 redact_text(assigned_agent or ""),
                 json_text(required_capabilities or [], []),
+                json_text(required_tools or [], []),
+                json_text(required_skills or [], []),
                 json_text(dependencies or [], []),
                 json_text(artifact_paths or [], []),
                 json_text(candidate_agents or [], []),
@@ -1265,6 +1660,8 @@ class MeshStore:
                 description=data.get("description"),
                 assigned_agent=data.get("assigned_agent") or data.get("assigned_to"),
                 required_capabilities=data.get("required_capabilities"),
+                required_tools=data.get("required_tools"),
+                required_skills=data.get("required_skills"),
                 artifact_paths=data.get("artifact_paths"),
                 priority=data.get("priority", "medium"),
                 project=data.get("project"),
@@ -1319,6 +1716,96 @@ class MeshStore:
         visit(parsed)
         return tokens
 
+    @staticmethod
+    def _name_tokens(value: Any) -> set[str]:
+        """Collect only declared tool/skill names, not arbitrary descriptions."""
+        tokens: set[str] = set()
+
+        def add(item: Any) -> None:
+            if isinstance(item, str) and item.strip():
+                text = item.strip().lower()
+                tokens.add(text)
+                tokens.add(text.replace("_", "-"))
+                tokens.add(text.replace("-", "_"))
+
+        def visit(item: Any) -> None:
+            if isinstance(item, str):
+                add(item)
+            elif isinstance(item, list):
+                for child in item:
+                    visit(child)
+            elif isinstance(item, dict):
+                for key in ("name", "tool", "id", "server", "mcp_server", "skill"):
+                    if key in item:
+                        add(item[key])
+                for key in ("tools", "mcp_servers", "skills"):
+                    if key in item:
+                        visit(item[key])
+
+        visit(value)
+        return tokens
+
+    def _shared_agent_tokens(
+        self, database: sqlite3.Connection, agent: dict[str, Any]
+    ) -> tuple[set[str], set[str]]:
+        """Return tool and skill names available to one agent.
+
+        A capability may be declared by the agent itself or published in the
+        shared registry.  Entries owned by ``shared`` are available to every
+        agent; provider-owned entries remain tied to that provider so routing
+        does not silently grant another agent its credentials or permissions.
+        """
+        name = str(agent.get("name") or "")
+        metadata = json_value(agent.get("metadata_json"), {})
+        if not isinstance(metadata, dict):
+            metadata = {}
+        tools = self._name_tokens(metadata.get("tools"))
+        tools.update(self._name_tokens(metadata.get("mcp_servers")))
+        skills = self._name_tokens(metadata.get("skills"))
+        owners = (name, "shared", "")
+        servers = database.execute(
+            "SELECT name, owner_agent, tools_json, status FROM mcp_servers"
+        ).fetchall()
+        for server in servers:
+            if (server["owner_agent"] or "") not in owners:
+                continue
+            status = str(server["status"] or "").lower()
+            if status in {"offline", "unavailable", "disabled"} or "registry" in status:
+                continue
+            server_name = str(server["name"] or "").strip().lower()
+            if server_name:
+                tools.update(self._name_tokens(server_name))
+            published = json_value(server["tools_json"], [])
+            if isinstance(published, list):
+                for item in published:
+                    if isinstance(item, dict):
+                        for key in ("name", "tool", "id"):
+                            value = item.get(key)
+                            if isinstance(value, str) and value.strip():
+                                tools.update(self._name_tokens(value))
+                                if server_name:
+                                    tools.update(
+                                        self._name_tokens(server_name + "/" + value)
+                                    )
+                    else:
+                        tools.update(self._name_tokens(item))
+        published_skills = database.execute(
+            "SELECT name, owner_agent, status FROM skills"
+        ).fetchall()
+        for skill in published_skills:
+            if (skill["owner_agent"] or "") in owners:
+                status = str(skill["status"] or "").lower()
+                if status in {"offline", "unavailable", "disabled"} or "registry" in status:
+                    continue
+                skills.update(self._name_tokens(skill["name"]))
+        return tools, skills
+
+    @staticmethod
+    def _name_matches(required: str, available: set[str]) -> bool:
+        value = str(required or "").strip().lower()
+        variants = {value, value.replace("_", "-"), value.replace("-", "_")}
+        return bool(variants & available)
+
     def _select_agent(
         self,
         database: sqlite3.Connection,
@@ -1327,6 +1814,8 @@ class MeshStore:
     ) -> dict[str, Any] | None:
         exclude = {str(item) for item in (exclude or set())}
         required = [str(item).lower() for item in json_value(task.get("required_capabilities_json"), [])]
+        required_tools = [str(item).lower() for item in json_value(task.get("required_tools_json"), [])]
+        required_skills = [str(item).lower() for item in json_value(task.get("required_skills_json"), [])]
         candidates = json_value(task.get("candidate_agents_json"), [])
         explicit = str(task.get("assigned_agent") or "")
         if explicit and int(task.get("attempt") or 0) == 0:
@@ -1350,6 +1839,17 @@ class MeshStore:
             matches = sum(1 for capability in required if capability in capabilities)
             if required and matches != len(required):
                 continue
+            tools, skills = self._shared_agent_tokens(database, agent)
+            tool_matches = sum(
+                1 for tool in required_tools if self._name_matches(tool, tools)
+            )
+            skill_matches = sum(
+                1 for skill in required_skills if self._name_matches(skill, skills)
+            )
+            if required_tools and tool_matches != len(required_tools):
+                continue
+            if required_skills and skill_matches != len(required_skills):
+                continue
             load = database.execute(
                 """
                 SELECT COUNT(*) FROM tasks
@@ -1361,7 +1861,14 @@ class MeshStore:
             if load >= limit:
                 continue
             # More capability matches, more free capacity, and lower load win.
-            score = (matches, limit - int(load), -int(load), name)
+            score = (
+                matches + tool_matches + skill_matches,
+                tool_matches,
+                skill_matches,
+                limit - int(load),
+                -int(load),
+                name,
+            )
             ranked.append((score, agent))
         if not ranked:
             return None
@@ -1471,12 +1978,16 @@ class MeshStore:
             "task_type": task.get("task_type") or "work",
             "attempt": task.get("attempt") or 0,
             "required_capabilities": json_value(task.get("required_capabilities_json"), []),
+            "required_tools": json_value(task.get("required_tools_json"), []),
+            "required_skills": json_value(task.get("required_skills_json"), []),
             "dependencies": dependencies,
             "interfaces": json_value(task.get("interfaces_json"), {}),
             "acceptance_criteria": task.get("acceptance_criteria") or "",
             "relevant_files": json_value(task.get("artifact_paths_json"), []),
             "constraints": task.get("constraints") or "",
             "input": json_value(task.get("input_json"), {}),
+            "previous_error": json_value(task.get("error_json"), {}),
+            "verification_status": task.get("verification_status") or "pending",
             "expected_result": {
                 "summary": "string",
                 "files_changed": "list",
@@ -1729,7 +2240,9 @@ class MeshStore:
                 continue
         return dispatched
 
-    def poll_tasks(self, agent: str, limit: int = 1) -> list[dict[str, Any]]:
+    def poll_tasks(
+        self, agent: str, limit: int = 1, task_reference: Any = None
+    ) -> list[dict[str, Any]]:
         agent = nonempty_text(agent, "agent", 200)
         limit = min(max(int(limit), 1), self.settings.max_parallel)
         stamp = utc_now()
@@ -1738,12 +2251,14 @@ class MeshStore:
             row = database.execute("SELECT * FROM agents WHERE name=?", (agent,)).fetchone()
             if row is None:
                 raise MeshError("agent is not registered", 404)
+            task_id = None
+            if task_reference not in (None, ""):
+                task_id = self._resolve_task_id(database, task_reference)
             database.execute(
                 "UPDATE agents SET last_seen_at=?, status='active', health='online' WHERE name=?",
                 (stamp, agent),
             )
-            rows = database.execute(
-                """
+            query = """
                 SELECT m.*, t.*
                 FROM messages m JOIN tasks t ON t.id=m.task_id
                 WHERE m.to_agent=? AND m.message_type='TASK_REQUEST'
@@ -1751,12 +2266,18 @@ class MeshStore:
                   AND (m.available_at IS NULL OR m.available_at <= ?)
                   AND (m.lease_expires_at IS NULL OR m.lease_expires_at <= ?)
                   AND t.status='sent'
+            """
+            values: list[Any] = [agent, stamp, stamp]
+            if task_id is not None:
+                query += " AND t.id=?"
+                values.append(task_id)
+            query += """
                 ORDER BY CASE t.priority WHEN 'critical' THEN 0 WHEN 'high' THEN 1 WHEN 'medium' THEN 2 ELSE 3 END,
                          m.created_at, m.id
                 LIMIT ?
-                """,
-                (agent, stamp, stamp, limit),
-            ).fetchall()
+            """
+            values.append(limit)
+            rows = database.execute(query, values).fetchall()
             for joined in rows:
                 message_id = int(joined["id"])
                 task_id = int(joined["task_id"])
@@ -2482,6 +3003,8 @@ class MeshStore:
                     description=task_plan.get("description") or task_plan.get("task") or "",
                     assigned_agent=task_plan.get("assigned_to") or task_plan.get("assigned_agent"),
                     required_capabilities=task_plan.get("required_capabilities") or task_plan.get("capabilities"),
+                    required_tools=task_plan.get("required_tools") or task_plan.get("tools"),
+                    required_skills=task_plan.get("required_skills") or task_plan.get("skills"),
                     dependencies=dependencies,
                     artifact_paths=task_plan.get("artifact_paths") or task_plan.get("relevant_files"),
                     candidate_agents=task_plan.get("candidate_agents"),
@@ -2651,6 +3174,228 @@ class MeshStore:
             ids = [row["id"] for row in database.execute("SELECT id FROM orchestration_runs ORDER BY updated_at DESC")]
         return [self.get_run(run_id) for run_id in ids]
 
+    @staticmethod
+    def _autonomous_json_fields(request: dict[str, Any]) -> dict[str, Any]:
+        result = dict(request)
+        for source, target, default in (
+            ("request_json", "request", {}),
+            ("consultation_json", "consultation", []),
+            ("report_json", "report", {}),
+            ("error_json", "error", {}),
+        ):
+            result[target] = json_value(result.get(source), default)
+        return result
+
+    def create_autonomous_request(self, data: dict[str, Any]) -> dict[str, Any]:
+        """Persist one high-level objective for the autonomous supervisor."""
+        objective = nonempty_text(
+            data.get("objective") or data.get("request") or data.get("goal"),
+            "objective",
+            100000,
+        )
+        lead = nonempty_text(
+            data.get("lead_agent")
+            or data.get("from_agent")
+            or os.environ.get("AGENT_MESH_DEFAULT_LEAD")
+            or "orchestrator",
+            "lead_agent",
+            200,
+        )
+        raw_workspace = (
+            data.get("workspace")
+            or os.environ.get("AGENT_MESH_WORKSPACE")
+            or str(self.settings.root)
+        )
+        workspace = Path(str(raw_workspace)).expanduser()
+        if not workspace.is_absolute():
+            workspace = Path.cwd() / workspace
+        workspace = workspace.resolve()
+        if not workspace.exists() or not workspace.is_dir():
+            raise MeshError("workspace must be an existing directory")
+        try:
+            requested_rounds = int(
+                data.get("max_rounds", self.settings.autonomy_max_rounds)
+            )
+        except (TypeError, ValueError) as exc:
+            raise MeshError("max_rounds must be an integer") from exc
+        if requested_rounds < 1 or requested_rounds > self.settings.autonomy_max_rounds:
+            raise MeshError("max_rounds exceeds the configured autonomy limit")
+        request_id = redact_text(data.get("autonomous_run_id") or str(uuid.uuid4()))
+        idempotency_key = redact_text(data.get("idempotency_key") or "") or None
+        planner_agent = redact_text(data.get("planner_agent") or "") or None
+        auditor_agent = redact_text(data.get("auditor_agent") or "") or None
+        integrator_agent = redact_text(data.get("integrator_agent") or "") or None
+        stamp = utc_now()
+        payload = dict(data)
+        payload["objective"] = objective
+        payload["lead_agent"] = lead
+        payload["workspace"] = str(workspace)
+        with self.transaction() as database:
+            if idempotency_key:
+                existing = database.execute(
+                    "SELECT * FROM autonomous_requests WHERE idempotency_key=?",
+                    (idempotency_key,),
+                ).fetchone()
+                if existing is not None:
+                    return self._autonomous_json_fields(dict(existing))
+            existing = database.execute(
+                "SELECT * FROM autonomous_requests WHERE id=?", (request_id,)
+            ).fetchone()
+            if existing is not None:
+                return self._autonomous_json_fields(dict(existing))
+            database.execute(
+                """
+                INSERT INTO autonomous_requests
+                (id, objective, lead_agent, workspace, state, max_rounds,
+                 planner_agent, auditor_agent, integrator_agent, idempotency_key,
+                 request_json, consultation_json, created_at, updated_at)
+                VALUES (?, ?, ?, ?, 'QUEUED', ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    request_id,
+                    objective,
+                    lead,
+                    str(workspace),
+                    requested_rounds,
+                    planner_agent,
+                    auditor_agent,
+                    integrator_agent,
+                    idempotency_key,
+                    json_text(payload, {}),
+                    json_text([], []),
+                    stamp,
+                    stamp,
+                ),
+            )
+            row = database.execute(
+                "SELECT * FROM autonomous_requests WHERE id=?", (request_id,)
+            ).fetchone()
+        assert row is not None
+        return self._autonomous_json_fields(dict(row))
+
+    def get_autonomous_request(self, request_id: str) -> dict[str, Any]:
+        request_id = nonempty_text(request_id, "autonomous_run_id", 200)
+        with self.connect() as database:
+            row = self._dict(
+                database.execute(
+                    "SELECT * FROM autonomous_requests WHERE id=?", (request_id,)
+                ).fetchone()
+            )
+        if row is None:
+            raise MeshError("autonomous run not found", 404)
+        return self._autonomous_json_fields(row)
+
+    def list_autonomous_requests(
+        self, states: set[str] | None = None, limit: int = 100
+    ) -> list[dict[str, Any]]:
+        limit = min(max(int(limit), 1), 1000)
+        query = "SELECT * FROM autonomous_requests"
+        values: list[Any] = []
+        if states:
+            valid = sorted({str(state).upper() for state in states} & AUTONOMOUS_STATES)
+            if not valid:
+                return []
+            query += " WHERE state IN (" + ",".join("?" for _ in valid) + ")"
+            values.extend(valid)
+        query += " ORDER BY updated_at ASC, id LIMIT ?"
+        values.append(limit)
+        with self.connect() as database:
+            rows = [dict(row) for row in database.execute(query, values)]
+        return [self._autonomous_json_fields(row) for row in rows]
+
+    def update_autonomous_request(
+        self,
+        request_id: str,
+        *,
+        state: str | None = None,
+        orchestration_run_id: str | None = None,
+        planner_agent: str | None = None,
+        auditor_agent: str | None = None,
+        integrator_agent: str | None = None,
+        round_number: int | None = None,
+        consultation: Any = None,
+        request_payload: Any = None,
+        report: Any = None,
+        error: Any = None,
+        completed_at: str | None = None,
+    ) -> dict[str, Any]:
+        request_id = nonempty_text(request_id, "autonomous_run_id", 200)
+        updates: list[str] = []
+        values: list[Any] = []
+        normalized_state = str(state).upper() if state is not None else None
+        if normalized_state is not None:
+            if normalized_state not in AUTONOMOUS_STATES:
+                raise MeshError("invalid autonomous run state")
+            updates.append("state=?")
+            values.append(normalized_state)
+        for column, value in (
+            ("orchestration_run_id", orchestration_run_id),
+            ("planner_agent", planner_agent),
+            ("auditor_agent", auditor_agent),
+            ("integrator_agent", integrator_agent),
+        ):
+            if value is not None:
+                updates.append(f"{column}=?")
+                values.append(redact_text(value))
+        if round_number is not None:
+            if int(round_number) < 0:
+                raise MeshError("round must not be negative")
+            updates.append("round=?")
+            values.append(int(round_number))
+        if consultation is not None:
+            updates.append("consultation_json=?")
+            values.append(json_text(consultation, []))
+        if request_payload is not None:
+            updates.append("request_json=?")
+            values.append(json_text(request_payload, {}))
+        if report is not None:
+            updates.append("report_json=?")
+            values.append(json_text(report, {}))
+        if error is not None:
+            updates.append("error_json=?")
+            values.append(json_text(error, {}))
+        if completed_at is not None:
+            updates.append("completed_at=?")
+            values.append(completed_at)
+        if normalized_state in AUTONOMOUS_TERMINAL and completed_at is None:
+            updates.append("completed_at=COALESCE(completed_at, ?)")
+            values.append(utc_now())
+        updates.append("updated_at=?")
+        values.append(utc_now())
+        values.append(request_id)
+        with self.transaction() as database:
+            if database.execute(
+                "SELECT 1 FROM autonomous_requests WHERE id=?", (request_id,)
+            ).fetchone() is None:
+                raise MeshError("autonomous run not found", 404)
+            database.execute(
+                "UPDATE autonomous_requests SET " + ", ".join(updates) + " WHERE id=?",
+                values,
+            )
+        return self.get_autonomous_request(request_id)
+
+    def record_event(
+        self,
+        event_type: str,
+        *,
+        actor: str | None = None,
+        run_id: str | None = None,
+        task_id: int | None = None,
+        message_id: int | None = None,
+        payload: Any = None,
+    ) -> None:
+        """Record a supervisor event without exposing the private transaction helper."""
+        with self.transaction() as database:
+            self._event(
+                database,
+                event_type,
+                actor=actor,
+                run_id=run_id,
+                task_id=task_id,
+                message_id=message_id,
+                payload=payload,
+            )
+
     def finalize_run(self, run_id: str, data: dict[str, Any]) -> dict[str, Any]:
         supplied = data.get("result") or data.get("final_result")
         if supplied is None and data.get("summary"):
@@ -2659,6 +3404,8 @@ class MeshStore:
         actor = data.get("finalized_by") or data.get("agent") or "orchestrator"
         with self.transaction() as database:
             run = self._run_row(database, run_id)
+            if run["state"] == "CANCELLED":
+                raise MeshError("cannot finalize a cancelled run", 409)
             tasks = [
                 dict(row)
                 for row in database.execute(
@@ -2801,6 +3548,7 @@ class MeshStore:
                     "skills",
                     "orchestration_runs",
                     "orchestration_events",
+                    "autonomous_requests",
                 )
             }
             queue = {

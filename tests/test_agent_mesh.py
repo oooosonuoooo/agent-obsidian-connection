@@ -10,7 +10,9 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 import unittest
+from dataclasses import replace
 from pathlib import Path
 from urllib.error import HTTPError
 from urllib.request import Request, urlopen
@@ -21,10 +23,14 @@ SCRIPTS = PROJECT / "scripts"
 sys.path.insert(0, str(SCRIPTS))
 
 from agent_mesh_core import MeshError, MeshStore, Settings, redact_text  # noqa: E402
+from agent_mesh_autonomy import AutonomyManager  # noqa: E402
 from agent_mesh_service import MeshHTTPServer  # noqa: E402
+from sync_shared_catalog import synchronize  # noqa: E402
 
 
-def test_settings(base: Path, *, token: str | None = None) -> Settings:
+def make_settings(
+    base: Path, *, token: str | None = None, autonomy_enabled: bool = False
+) -> Settings:
     return Settings(
         root=base,
         db=base / "agent_mesh.sqlite",
@@ -41,6 +47,11 @@ def test_settings(base: Path, *, token: str | None = None) -> Settings:
         max_delegation_depth=3,
         reaper_interval=0.1,
         max_body_bytes=1024 * 1024,
+        autonomy_enabled=autonomy_enabled,
+        autonomy_interval=0.05,
+        autonomy_max_workers=4,
+        autonomy_max_rounds=2,
+        autonomy_command_timeout=5,
     )
 
 
@@ -48,10 +59,15 @@ class MeshTestCase(unittest.TestCase):
     def setUp(self) -> None:
         self.tempdir = tempfile.TemporaryDirectory(prefix="agent-mesh-test-")
         self.base = Path(self.tempdir.name)
-        self.settings = test_settings(self.base)
+        self.settings = make_settings(self.base)
         self.store = MeshStore(self.settings)
+        self._http_servers: list[tuple[MeshHTTPServer, threading.Thread]] = []
 
     def tearDown(self) -> None:
+        for server, thread in reversed(self._http_servers):
+            server.shutdown()
+            thread.join(timeout=2)
+            server.server_close()
         self.tempdir.cleanup()
 
     def register(self, name: str, capabilities: list[str], **extra) -> dict:
@@ -104,18 +120,54 @@ class MeshTestCase(unittest.TestCase):
             {"verified_by": "Lead", "valid": True},
         )
 
-    def start_http(self, token: str = "unit-test-token"):
-        settings = test_settings(self.base, token=token)
+    def start_http(
+        self, token: str = "unit-test-token", *, autonomy_enabled: bool = False
+    ):
+        settings = make_settings(
+            self.base, token=token, autonomy_enabled=autonomy_enabled
+        )
         server = MeshHTTPServer((settings.host, 0), settings)
         thread = threading.Thread(target=server.serve_forever, daemon=True)
         thread.start()
-        self.addCleanup(server.shutdown)
-        self.addCleanup(server.server_close)
-        self.addCleanup(thread.join, 2)
+        self._http_servers.append((server, thread))
         return server, f"http://127.0.0.1:{server.server_address[1]}"
 
 
 class AgentMeshCoreTests(MeshTestCase):
+    def test_shared_tool_and_skill_requirements_route_to_the_publishing_agent(self) -> None:
+        self.register(
+            "ToolOwner",
+            ["analysis"],
+            metadata={
+                "tools": [{"name": "web-search", "description": "search"}],
+                "skills": ["research-synthesis"],
+            },
+        )
+        self.register("OtherAgent", ["analysis"])
+        run = self.store.create_run(
+            {
+                "run_id": "shared-capability-routing",
+                "request": "Use a published shared tool and skill",
+                "lead_agent": "Lead",
+                "plan": {
+                    "tasks": [
+                        {
+                            "task_id": "shared-capability-task",
+                            "title": "Use shared capabilities",
+                            "required_capabilities": ["analysis"],
+                            "required_tools": ["web-search"],
+                            "required_skills": ["research-synthesis"],
+                        }
+                    ]
+                },
+            }
+        )
+        self.store.dispatch_runnable(run["id"])
+        task = self.store.get_task("shared-capability-task")
+        self.assertEqual(task["assigned_agent"], "ToolOwner")
+        self.assertEqual(task["required_tools"], ["web-search"])
+        self.assertEqual(task["required_skills"], ["research-synthesis"])
+
     def test_discovery_consultation_dag_and_verified_final_result(self) -> None:
         self.register("Lead", ["orchestration"])
         self.register("Frontend", ["frontend", "consultation"])
@@ -374,6 +426,205 @@ class AgentMeshCoreTests(MeshTestCase):
         self.assertEqual(count, 1)
 
 
+class AutonomousSupervisorTests(MeshTestCase):
+    @staticmethod
+    def command_for(value: dict) -> list[str]:
+        return [
+            sys.executable,
+            "-c",
+            "import json; print(json.dumps(" + repr(value) + "))",
+        ]
+
+    def autonomous_settings(self) -> Settings:
+        return replace(make_settings(self.base, autonomy_enabled=True), ack_timeout=5)
+
+    def register_adapter(
+        self, name: str, capabilities: list[str], output: dict, **extra
+    ) -> None:
+        self.register(
+            name,
+            capabilities,
+            metadata={
+                "autonomy_adapter": {
+                    "kind": "command",
+                    "argv": self.command_for(output),
+                }
+            },
+            **extra,
+        )
+
+    def wait_for_terminal(self, manager: AutonomyManager, request_id: str) -> dict:
+        deadline = time.monotonic() + 10
+        current = manager.snapshot(request_id)
+        while current["state"] not in {"COMPLETED", "FAILED", "BLOCKED", "CANCELLED"}:
+            if time.monotonic() >= deadline:
+                self.fail(f"autonomous run did not finish: {current['state']}")
+            time.sleep(0.05)
+            current = manager.snapshot(request_id)
+        return current
+
+    def test_generated_plan_runs_real_adapters_through_audit_and_integration(self) -> None:
+        self.register_adapter(
+            "Planner",
+            ["orchestration"],
+            {
+                "tasks": [
+                    {
+                        "task_id": "implementation",
+                        "title": "Implement the requested change",
+                        "description": "Perform the actual implementation in the workspace.",
+                        "assigned_agent": "Worker",
+                        "required_capabilities": ["python"],
+                        "acceptance_criteria": "A structured worker result is present.",
+                    }
+                ]
+            },
+        )
+        self.register_adapter(
+            "Consultant",
+            ["analysis"],
+            {"summary": "Consultation recommends an evidence-backed implementation and test gate."},
+        )
+        self.register_adapter(
+            "Worker",
+            ["python"],
+            {"summary": "Worker performed the assigned implementation.", "tests": ["worker smoke"]},
+        )
+        self.register_adapter(
+            "Auditor",
+            ["testing"],
+            {"valid": True, "issues": [], "tests_to_run": ["audit smoke"]},
+        )
+        self.register_adapter(
+            "Integrator",
+            ["orchestration"],
+            {"summary": "Lead integration completed from verified evidence.", "tests": ["integration smoke"]},
+        )
+        settings = self.autonomous_settings()
+        store = MeshStore(settings)
+        manager = AutonomyManager(store, settings)
+        try:
+            submitted = manager.submit(
+                {
+                    "objective": "Build and verify a small coordinated implementation",
+                    "lead_agent": "Lead",
+                    "planner_agent": "Planner",
+                    "auditor_agent": "Auditor",
+                    "integrator_agent": "Integrator",
+                    "consultation": True,
+                    "consultation_agents": ["Consultant"],
+                    "workspace": str(self.base),
+                }
+            )
+            result = self.wait_for_terminal(manager, submitted["id"])
+        finally:
+            manager.stop()
+
+        self.assertEqual(result["state"], "COMPLETED")
+        self.assertEqual(result["consultation"][0]["agent"], "Consultant")
+        self.assertEqual(result["orchestration"]["tasks"][0]["status"], "completed")
+        worker = next(agent for agent in store.list_agents() if agent["name"] == "Worker")
+        self.assertEqual(worker["health"], "online")
+        self.assertTrue(worker["autonomy_ready"])
+        final = result["report"]["final_result"]
+        self.assertEqual(final["integration_mode"], "provider")
+        self.assertTrue(
+            {"Lead", "Planner", "Consultant", "Worker", "Auditor", "Integrator"}
+            <= set(final["agents_involved"])
+        )
+        events = {event["event_type"] for event in result["orchestration"]["events"]}
+        self.assertTrue(
+            {
+                "autonomy.consultation_completed",
+                "autonomy.plan_requested",
+                "autonomy.audit_passed",
+                "autonomy.completed",
+            }
+            <= events
+        )
+
+    def test_cooperative_agent_waits_for_mcp_worker_and_lead_verification(self) -> None:
+        import agent_mesh_adapters
+
+        original_profiles = agent_mesh_adapters.BUILTIN_AGENT_PROFILES
+        agent_mesh_adapters.BUILTIN_AGENT_PROFILES = ()
+        settings = self.autonomous_settings()
+        store = MeshStore(settings)
+        self.register("Cooperative", ["python"])
+        manager = AutonomyManager(store, settings)
+        try:
+            submitted = manager.submit(
+                {
+                    "objective": "Complete cooperative work",
+                    "lead_agent": "Lead",
+                    "workspace": str(self.base),
+                    "plan": {
+                        "tasks": [
+                            {
+                                "task_id": "cooperative-task",
+                                "title": "Cooperative task",
+                                "assigned_agent": "Cooperative",
+                                "required_capabilities": ["python"],
+                            }
+                        ]
+                    },
+                }
+            )
+            waiting = self.wait_for_state(manager, submitted["id"], "WAITING")
+            inbox = store.poll_tasks("Cooperative", 1)
+            self.assertEqual(len(inbox), 1)
+            message = inbox[0]["message"]
+            store.acknowledge_task(
+                "cooperative-task",
+                {"agent": "Cooperative", "message_id": message["id"], "accepted": True},
+            )
+            store.submit_result(
+                "cooperative-task",
+                {
+                    "agent": "Cooperative",
+                    "result": {"summary": "Cooperative agent completed the task."},
+                },
+            )
+            self.wait_for_state(manager, submitted["id"], "WAITING")
+            store.verify_task(
+                "cooperative-task",
+                {"verified_by": "Lead", "valid": True},
+            )
+            completed = self.wait_for_terminal(manager, submitted["id"])
+        finally:
+            manager.stop()
+            agent_mesh_adapters.BUILTIN_AGENT_PROFILES = original_profiles
+
+        self.assertEqual(waiting["state"], "WAITING")
+        self.assertEqual(completed["state"], "COMPLETED")
+        self.assertEqual(
+            completed["report"]["final_result"]["integration_mode"],
+            "evidence_aggregation",
+        )
+        with store.connect() as database:
+            types = {
+                row["message_type"]
+                for row in database.execute(
+                    "SELECT message_type FROM messages WHERE to_agent='Lead'"
+                )
+            }
+        self.assertIn("CLARIFICATION_REQUEST", types)
+
+    def wait_for_state(
+        self, manager: AutonomyManager, request_id: str, expected: str
+    ) -> dict:
+        deadline = time.monotonic() + 10
+        current = manager.snapshot(request_id)
+        while current["state"] != expected:
+            if current["state"] in {"COMPLETED", "FAILED", "BLOCKED", "CANCELLED"}:
+                self.fail(f"expected {expected}, got {current['state']}")
+            if time.monotonic() >= deadline:
+                self.fail(f"autonomous run did not reach {expected}: {current['state']}")
+            time.sleep(0.05)
+            current = manager.snapshot(request_id)
+        return current
+
+
 class MigrationTests(unittest.TestCase):
     def test_legacy_schema_is_migrated_without_losing_rows(self) -> None:
         with tempfile.TemporaryDirectory(prefix="agent-mesh-migration-test-") as temp:
@@ -399,7 +650,7 @@ class MigrationTests(unittest.TestCase):
             database.commit()
             database.close()
 
-            store = MeshStore(test_settings(base))
+            store = MeshStore(make_settings(base))
             self.assertEqual(store.get_task("legacy-task-1")["title"], "old task")
             self.assertEqual(store.get_messages("Legacy")[0]["body"], "preserve me")
             with store.connect() as database:
@@ -526,6 +777,162 @@ class HTTPAndMCPTests(MeshTestCase):
         self.assertEqual(final["state"], "COMPLETED")
         self.assertEqual(len(final["tasks"]), 2)
         self.assertIsNotNone(server.store.get_run("http-e2e")["final_result"])
+
+    def test_shared_capability_catalog_is_safe_and_available_over_http(self) -> None:
+        _, base_url = self.start_http()
+        status, _ = self.http_request(
+            base_url,
+            "POST",
+            "/agents/register",
+            {
+                "name": "ToolPublisher",
+                "provider": "shared-test",
+                "tools": [{"name": "web-search"}],
+                "skills": ["research-synthesis"],
+            },
+        )
+        self.assertEqual(status, 200)
+        status, skill = self.http_request(
+            base_url,
+            "POST",
+            "/skills/register",
+            {
+                "name": "research-synthesis",
+                "owner_agent": "ToolPublisher",
+                "skill_type": "analysis",
+                "invocation_method": "route to ToolPublisher through an autonomous task",
+            },
+        )
+        self.assertEqual(status, 201)
+        status, server = self.http_request(
+            base_url,
+            "POST",
+            "/mcp/servers/register",
+            {
+                "name": "search-server",
+                "owner_agent": "ToolPublisher",
+                "endpoint": "https://example.test/mcp?apiKey=not-a-real-value",
+                "transport": "HTTP",
+                "auth_ref": "SEARCH_API_KEY",
+                "tools": [{"name": "web-search"}],
+            },
+        )
+        self.assertEqual(status, 201)
+        self.assertEqual(skill["name"], "research-synthesis")
+        self.assertEqual(server["name"], "search-server")
+        self.assertNotIn("?", server["endpoint"])
+        self.assertTrue(server["auth_configured"])
+        status, catalog = self.http_request(base_url, "GET", "/shared/capabilities")
+        self.assertEqual(status, 200)
+        self.assertTrue(any(item["name"] == "research-synthesis" for item in catalog["skills"]))
+        self.assertTrue(any(item["name"] == "web-search" for item in catalog["tools"]))
+        safe_server = next(item for item in catalog["mcp_servers"] if item["name"] == "search-server")
+        self.assertNotIn("?", safe_server["endpoint"])
+        self.assertTrue(safe_server["auth_configured"])
+        self.assertTrue(any(item["name"] == "ToolPublisher" for item in catalog["agents"]))
+
+    def test_canonical_registries_bootstrap_shared_catalog(self) -> None:
+        root = self.base / "AI-Second-Brain"
+        registry = root / "AI-Second-Brain-Vault/04_Ecosystem/Registries"
+        registry.mkdir(parents=True)
+        (registry / "MCP_Registry.md").write_text(
+            "| Name | Description | Version | Source Agent(s) | Depends On | Live File Location | Status | Auth |\n"
+            "|---|---|---|---|---|---|---|---|\n"
+            "| web-search | Search | 1 | Codex, Antigravity | node | `https://example.test/mcp?apiKey=<key>` | ✅ Active | EXA_API_KEY |\n"
+            "| unavailable | Offline | 1 | Registry only | — | — | ❌ Offline | none |\n",
+            encoding="utf-8",
+        )
+        (registry / "Skill_Registry_Index.md").write_text(
+            "| Name | Description | Version | Source Agent(s) | Depends On | Live File Location | Status |\n"
+            "|---|---|---|---|---|---|---|\n"
+            "| secure-review | Review code | 1 | Claude Code | — | plugin | Active |\n",
+            encoding="utf-8",
+        )
+        self.register("Codex", ["coding"], metadata={"autonomy": {"available": True}})
+        self.register("Claude-FCC", ["security"], metadata={"autonomy": {"available": True}})
+        mcp_count, skill_count = synchronize(self.store, root)
+        self.assertEqual((mcp_count, skill_count), (2, 1))
+        catalog = self.store.shared_capability_catalog()
+        server = next(item for item in catalog["mcp_servers"] if item["name"] == "web-search")
+        self.assertEqual(server["owner_agent"], "Codex")
+        self.assertNotIn("?", server["endpoint"])
+        self.assertTrue(server["auth_configured"])
+        self.assertTrue(any(item["name"] == "secure-review" for item in catalog["skills"]))
+
+    def test_http_autonomous_run_uses_registered_real_adapters(self) -> None:
+        _, base_url = self.start_http(autonomy_enabled=True)
+
+        def provider_command(value: dict) -> list[str]:
+            return [
+                sys.executable,
+                "-c",
+                "import json; print(json.dumps(" + repr(value) + "))",
+            ]
+
+        for name, capabilities, output in (
+            ("Lead", ["orchestration"], {"summary": "lead"}),
+            ("Worker", ["python"], {"summary": "worker completed"}),
+            ("Auditor", ["testing"], {"valid": True, "issues": []}),
+            ("Integrator", ["orchestration"], {"summary": "integrated"}),
+        ):
+            payload = {
+                "name": name,
+                "provider": "http-test",
+                "capabilities": capabilities,
+            }
+            if name != "Lead":
+                payload["autonomy_adapter"] = {
+                    "kind": "command",
+                    "argv": provider_command(output),
+                }
+            status, _ = self.http_request(
+                base_url,
+                "POST",
+                "/agents/register",
+                payload,
+            )
+            self.assertEqual(status, 200)
+
+        status, submitted = self.http_request(
+            base_url,
+            "POST",
+            "/autonomous/runs",
+            {
+                "objective": "Complete a real HTTP autonomous workflow",
+                "lead_agent": "Lead",
+                "auditor_agent": "Auditor",
+                "integrator_agent": "Integrator",
+                "workspace": str(self.base),
+                "plan": {
+                    "tasks": [
+                        {
+                            "task_id": "http-worker",
+                            "title": "Run worker",
+                            "description": "Perform the HTTP test task.",
+                            "assigned_agent": "Worker",
+                            "required_capabilities": ["python"],
+                        }
+                    ]
+                },
+            },
+        )
+        self.assertEqual(status, 202)
+        request_id = submitted["id"]
+        deadline = time.monotonic() + 10
+        current = submitted
+        while current["state"] not in {"COMPLETED", "FAILED", "BLOCKED", "CANCELLED"}:
+            if time.monotonic() >= deadline:
+                self.fail("HTTP autonomous run did not finish")
+            time.sleep(0.05)
+            status, current = self.http_request(
+                base_url, "GET", "/autonomous/runs/" + request_id
+            )
+            self.assertEqual(status, 200)
+        self.assertEqual(current["state"], "COMPLETED")
+        self.assertEqual(
+            current["report"]["final_result"]["integration_mode"], "provider"
+        )
+        self.assertIn("Auditor", current["report"]["final_result"]["agents_involved"])
 
     def test_legacy_routes_remain_usable(self) -> None:
         server, base_url = self.start_http()
@@ -676,6 +1083,9 @@ class HTTPAndMCPTests(MeshTestCase):
         tool_names = {tool["name"] for tool in tools["result"]["tools"]}
         self.assertIn("agent_mesh_poll_tasks", tool_names)
         self.assertIn("agent_mesh_finalize_run", tool_names)
+        self.assertIn("agent_mesh_list_shared_capabilities", tool_names)
+        self.assertIn("agent_mesh_list_shared_tools", tool_names)
+        self.assertIn("agent_mesh_list_shared_skills", tool_names)
         send({"jsonrpc": "2.0", "id": 3, "method": "shutdown", "params": {}})
         process.wait(timeout=2)
 

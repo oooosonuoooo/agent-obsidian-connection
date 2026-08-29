@@ -9,6 +9,8 @@ from __future__ import annotations
 
 import json
 import os
+import threading
+import time
 import sys
 import urllib.error
 import urllib.parse
@@ -67,7 +69,7 @@ def send_message(message, mode: str = "content-length") -> None:
     sys.stdout.buffer.flush()
 
 
-def http(method: str, path: str, data=None):
+def http(method: str, path: str, data=None, *, timeout: float = 15):
     headers = {"Accept": "application/json"}
     auth_token = token()
     if auth_token:
@@ -77,7 +79,7 @@ def http(method: str, path: str, data=None):
         headers["Content-Type"] = "application/json"
     request = urllib.request.Request(BASE + path, data=body, headers=headers, method=method)
     try:
-        with urllib.request.urlopen(request, timeout=15) as response:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
             raw = response.read().decode()
             return json.loads(raw) if raw else {}
     except urllib.error.HTTPError as exc:
@@ -88,6 +90,128 @@ def http(method: str, path: str, data=None):
         except (ValueError, AttributeError):
             detail = str(exc)
         raise RuntimeError(str(detail)) from exc
+
+
+def _parent_commands() -> list[str]:
+    """Read a short Linux parent-process chain without invoking a shell."""
+    commands: list[str] = []
+    pid = os.getppid()
+    for _ in range(6):
+        if pid <= 1:
+            break
+        try:
+            raw = Path(f"/proc/{pid}/cmdline").read_bytes()
+            command = raw.replace(b"\0", b" ").decode(errors="replace").strip()
+            if command:
+                commands.append(command.lower())
+            stat = Path(f"/proc/{pid}/stat").read_text(errors="replace")
+            suffix = stat.rsplit(") ", 1)[1].split()
+            pid = int(suffix[1])
+        except (OSError, IndexError, ValueError):
+            break
+    return commands
+
+
+def default_agent_name() -> str:
+    """Resolve the MCP client's identity without requiring per-client config."""
+    explicit = os.environ.get("AGENT_MESH_AGENT_NAME") or os.environ.get(
+        "AGENT_MESH_CLIENT_NAME"
+    )
+    if explicit and explicit.strip():
+        return explicit.strip()
+    commands = _parent_commands()
+    joined = " ".join(commands)
+    if "antigravity" in joined:
+        return "gemini-antigravity"
+    if "fcc-claude" in joined or "claude" in joined:
+        return "Claude-FCC"
+    if "opencode" in joined:
+        return "OpenCode"
+    if "codex" in joined:
+        return "Codex"
+    if "cursor" in joined:
+        return "Cursor"
+    if "kiro" in joined:
+        return "Kiro"
+    if "kilo" in joined:
+        return "Kilo"
+    if "cascade" in joined or "windsurf" in joined or "codeium" in joined:
+        return "Cascade"
+    if "friday" in joined:
+        return "Friday-Pro" if " pro" in joined else "Friday"
+    if "gemini" in joined:
+        return "Gemini"
+    return "orchestrator"
+
+
+def announce_agent() -> str:
+    """Register/heartbeat the actual MCP client when its identity is knowable."""
+    name = default_agent_name()
+    if name == "orchestrator":
+        return ""
+    path_name = urllib.parse.quote(name, safe="")
+    try:
+        http("GET", "/agents/" + path_name, timeout=2)
+    except Exception:
+        try:
+            http(
+                "POST",
+                "/agents/register",
+                {
+                    "name": name,
+                    "provider": name,
+                    "type": "mcp-client",
+                    "capabilities": {
+                        "mcp": True,
+                        "orchestration": True,
+                        "task_execution": True,
+                    },
+                    "status": "active",
+                    "health": "online",
+                    "metadata": {
+                        "autonomy": {
+                            "role": "lead",
+                            "adapter_kind": "cooperative",
+                            "session": "mcp",
+                        }
+                    },
+                },
+                timeout=2,
+            )
+        except Exception:
+            return ""
+    else:
+        try:
+            http(
+                "POST",
+                "/agents/" + path_name + "/heartbeat",
+                {"status": "active", "health": "online"},
+                timeout=2,
+            )
+        except Exception:
+            return ""
+    return name
+
+
+def heartbeat_loop(name: str) -> None:
+    """Refresh a live client session until its stdio process exits."""
+    try:
+        interval = max(float(os.environ.get("AGENT_MESH_HEARTBEAT_INTERVAL", 30)), 5)
+    except (TypeError, ValueError):
+        interval = 30.0
+    path_name = urllib.parse.quote(name, safe="")
+    while True:
+        time.sleep(interval)
+        try:
+            http(
+                "POST",
+                "/agents/" + path_name + "/heartbeat",
+                {"status": "active", "health": "online"},
+                timeout=2,
+            )
+        except Exception:
+            # A transient service restart should not kill the client bridge.
+            continue
 
 
 def schema(properties=None, required=None):
@@ -121,6 +245,57 @@ TOOLS = [
         "inputSchema": schema(),
     },
     {
+        "name": "agent_mesh_list_shared_capabilities",
+        "description": "List all federated agents, MCP servers/tools, skills, health, and safe routing metadata.",
+        "inputSchema": schema(),
+    },
+    {
+        "name": "agent_mesh_list_shared_tools",
+        "description": "List tools published by other agents without exposing credentials; request use through an autonomous task.",
+        "inputSchema": schema(),
+    },
+    {
+        "name": "agent_mesh_list_shared_skills",
+        "description": "List skills published by other agents and their safe invocation metadata.",
+        "inputSchema": schema(),
+    },
+    {
+        "name": "agent_mesh_register_shared_skill",
+        "description": "Publish or update a skill in the shared registry for capability-based routing.",
+        "inputSchema": schema(
+            {
+                "name": {"type": "string"},
+                "owner_agent": {"type": "string"},
+                "skill_type": {"type": "string"},
+                "input_format": {"type": "string"},
+                "output_format": {"type": "string"},
+                "invocation_method": {"type": "string"},
+                "limitations": {"type": "string"},
+                "status": {"type": "string"},
+                "last_verified_at": {"type": "string"},
+            },
+            ["name"],
+        ),
+    },
+    {
+        "name": "agent_mesh_register_shared_mcp_server",
+        "description": "Publish or update an MCP server and its tool names in the shared registry; credentials stay local to the owner.",
+        "inputSchema": schema(
+            {
+                "name": {"type": "string"},
+                "owner_agent": {"type": "string"},
+                "endpoint": {"type": "string"},
+                "transport": {"type": "string"},
+                "auth_ref": {"type": "string"},
+                "tools": {"type": "array", "items": {}},
+                "safety_limits": {"type": "object"},
+                "status": {"type": "string"},
+                "last_verified_at": {"type": "string"},
+            },
+            ["name"],
+        ),
+    },
+    {
         "name": "agent_mesh_send_message",
         "description": "Persist a direct or protocol message for another agent.",
         "inputSchema": schema(
@@ -151,6 +326,98 @@ TOOLS = [
             },
             ["from_agent", "to_agent", "request"],
         ),
+    },
+    {
+        "name": "agent_mesh_register_agent",
+        "description": "Register an agent, its capabilities, and an optional real autonomy adapter once for the shared team.",
+        "inputSchema": schema(
+            {
+                "name": {"type": "string"},
+                "provider": {"type": "string"},
+                "model": {"type": "string"},
+                "type": {"type": "string"},
+                "capabilities": {},
+                "limitations": {"type": "string"},
+                "endpoint": {"type": "string"},
+                "metadata": {"type": "object"},
+                "tools": {"type": "array", "items": {}},
+                "skills": {"type": "array", "items": {}},
+                "mcp_servers": {"type": "array", "items": {}},
+                "autonomy_adapter": {"type": "object"},
+                "max_concurrent_tasks": {"type": "integer"},
+            },
+            ["name"],
+        ),
+    },
+    {
+        "name": "agent_mesh_start_autonomous_run",
+        "description": "Give the shared autonomous company one objective; it plans, delegates, executes real adapters, audits, revises, tests, and produces a final report.",
+        "inputSchema": schema(
+            {
+                "objective": {"type": "string"},
+                "lead_agent": {"type": "string"},
+                "workspace": {"type": "string"},
+                "plan": {"type": "object"},
+                "tasks": {"type": "array", "items": {"type": "object"}},
+                "planner_agent": {"type": "string"},
+                "auditor_agent": {"type": "string"},
+                "integrator_agent": {"type": "string"},
+                "consultation": {"type": "boolean"},
+                "consultation_agents": {"type": "array", "items": {"type": "string"}},
+                "consultation_max_agents": {"type": "integer"},
+                "max_rounds": {"type": "integer"},
+                "max_delegation_depth": {"type": "integer"},
+                "idempotency_key": {"type": "string"},
+            },
+            ["objective"],
+        ),
+    },
+    {
+        "name": "agent_mesh_get_autonomous_run",
+        "description": "Read autonomous progress, delegated tasks, audit results, events, and the final report.",
+        "inputSchema": schema({"autonomous_run_id": {"type": "string"}}, ["autonomous_run_id"]),
+    },
+    {
+        "name": "agent_mesh_list_autonomous_runs",
+        "description": "List high-level autonomous objectives and their current terminal or recovery state.",
+        "inputSchema": schema(),
+    },
+    {
+        "name": "agent_mesh_wait_autonomous_run",
+        "description": "Wait for an autonomous objective to complete or become genuinely blocked, then return its full report/state.",
+        "inputSchema": schema(
+            {
+                "autonomous_run_id": {"type": "string"},
+                "timeout_seconds": {"type": "number"},
+                "poll_interval": {"type": "number"},
+            },
+            ["autonomous_run_id"],
+        ),
+    },
+    {
+        "name": "agent_mesh_resume_autonomous_run",
+        "description": "Resume a blocked or interrupted autonomous objective after a provider/agent becomes available.",
+        "inputSchema": schema(
+            {
+                "autonomous_run_id": {"type": "string"},
+                "plan": {"type": "object"},
+                "tasks": {"type": "array", "items": {"type": "object"}},
+            },
+            ["autonomous_run_id"],
+        ),
+    },
+    {
+        "name": "agent_mesh_cancel_autonomous_run",
+        "description": "Cancel an autonomous objective and propagate durable cancellation to active workers.",
+        "inputSchema": schema(
+            {"autonomous_run_id": {"type": "string"}, "actor": {"type": "string"}},
+            ["autonomous_run_id"],
+        ),
+    },
+    {
+        "name": "agent_mesh_list_adapters",
+        "description": "Inspect which real CLI, HTTP, MCP, or cooperative adapters are available to the shared supervisor.",
+        "inputSchema": schema(),
     },
     {
         "name": "agent_mesh_create_orchestration_run",
@@ -204,7 +471,12 @@ TOOLS = [
         "name": "agent_mesh_poll_tasks",
         "description": "Poll and lease TASK_REQUEST messages addressed to this real worker agent.",
         "inputSchema": schema(
-            {"agent": {"type": "string"}, "limit": {"type": "integer"}},
+            {
+                "agent": {"type": "string"},
+                "limit": {"type": "integer"},
+                "task_id": {"type": "string"},
+                "task_key": {"type": "string"},
+            },
             ["agent"],
         ),
     },
@@ -342,10 +614,67 @@ def call_tool(name: str, arguments: dict):
         return http("GET", "/agents/" + encoded(arguments["agent"]))
     if name == "agent_mesh_list_capabilities":
         return http("GET", "/capabilities")
+    if name == "agent_mesh_list_shared_capabilities":
+        return http("GET", "/shared/capabilities")
+    if name == "agent_mesh_list_shared_tools":
+        return http("GET", "/shared/tools")
+    if name == "agent_mesh_list_shared_skills":
+        return http("GET", "/shared/skills")
+    if name == "agent_mesh_register_shared_skill":
+        return http("POST", "/skills/register", arguments)
+    if name == "agent_mesh_register_shared_mcp_server":
+        return http("POST", "/mcp/servers/register", arguments)
     if name == "agent_mesh_send_message":
         return http("POST", "/messages", arguments)
     if name == "agent_mesh_create_handoff":
         return http("POST", "/handoff", arguments)
+    if name == "agent_mesh_register_agent":
+        return http("POST", "/agents/register", arguments)
+    if name == "agent_mesh_start_autonomous_run":
+        arguments = dict(arguments)
+        arguments.setdefault("lead_agent", default_agent_name())
+        return http("POST", "/autonomous/runs", arguments)
+    if name == "agent_mesh_get_autonomous_run":
+        return http(
+            "GET",
+            "/autonomous/runs/" + encoded(arguments["autonomous_run_id"]),
+        )
+    if name == "agent_mesh_list_autonomous_runs":
+        return http("GET", "/autonomous/runs")
+    if name == "agent_mesh_wait_autonomous_run":
+        timeout = min(max(float(arguments.get("timeout_seconds", 1800)), 1), 7200)
+        interval = min(max(float(arguments.get("poll_interval", 2)), 0.2), 30)
+        deadline = time.monotonic() + timeout
+        current = http(
+            "GET",
+            "/autonomous/runs/" + encoded(arguments["autonomous_run_id"]),
+        )
+        while current.get("state") not in {"COMPLETED", "FAILED", "BLOCKED", "CANCELLED"}:
+            if time.monotonic() >= deadline:
+                current["wait_timeout"] = True
+                return current
+            time.sleep(interval)
+            current = http(
+                "GET",
+                "/autonomous/runs/" + encoded(arguments["autonomous_run_id"]),
+            )
+        return current
+    if name == "agent_mesh_resume_autonomous_run":
+        payload = dict(arguments)
+        payload.pop("autonomous_run_id", None)
+        return http(
+            "POST",
+            "/autonomous/runs/" + encoded(arguments["autonomous_run_id"]) + "/resume",
+            payload,
+        )
+    if name == "agent_mesh_cancel_autonomous_run":
+        return http(
+            "POST",
+            "/autonomous/runs/" + encoded(arguments["autonomous_run_id"]) + "/cancel",
+            arguments,
+        )
+    if name == "agent_mesh_list_adapters":
+        return http("GET", "/autonomous/adapters")
     if name == "agent_mesh_create_orchestration_run":
         return http("POST", "/orchestration/runs", arguments)
     if name == "agent_mesh_get_run":
@@ -446,7 +775,19 @@ def initialize_result(request):
             "resources": {"subscribe": False, "listChanged": False},
             "prompts": {"listChanged": False},
         },
-        "serverInfo": {"name": "agent-mesh-stdio", "version": "2.0.0"},
+        "instructions": (
+            "This is the shared autonomous Agent Mesh control plane. For every substantive user objective, "
+            "the receiving agent is the lead: discover the team, call agent_mesh_start_autonomous_run, "
+            "wait with agent_mesh_wait_autonomous_run, and return only the verified final report. "
+            "Use direct tools for simple local work when delegation adds no value. Never claim another agent "
+            "worked unless the durable run contains its real ACK/result evidence. The bridge announces the "
+            "MCP client's identity automatically when it can identify the parent process. Before planning, "
+            "call agent_mesh_list_shared_capabilities (or the shared tools/skills variants) to discover "
+            "capabilities published by every connected agent. Put needed names in required_tools and "
+            "required_skills when starting a run; the supervisor routes execution to the authorized owner "
+            "without copying credentials or pretending a GUI-only agent is online."
+        ),
+        "serverInfo": {"name": "agent-mesh-stdio", "version": "2.1.0"},
     }
 
 
@@ -496,6 +837,15 @@ def process(request, mode: str = "content-length"):
             )
         return False
 
+
+AGENT_NAME = announce_agent()
+if AGENT_NAME:
+    threading.Thread(
+        target=heartbeat_loop,
+        args=(AGENT_NAME,),
+        name="agent-mesh-client-heartbeat",
+        daemon=True,
+    ).start()
 
 while True:
     incoming = read_message()

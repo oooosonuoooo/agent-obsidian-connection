@@ -39,6 +39,9 @@ Both components expose **MCP (Model Context Protocol) stdio bridges** for AI age
 - 🌉 **Friday bridge** — dedicated heartbeat bridge for the Friday local LLM assistant
 - 🔄 **Task leasing** — agents can claim, heartbeat, and release tasks to avoid conflicts
 - 🧭 **Durable orchestration** — lead-agent planning, capability routing, task DAGs, ACK/result protocol, verification, retries, and reassignment
+- 🤖 **Autonomous one-objective workflow** — any connected agent can lead; the supervisor plans, consults specialists, dispatches real providers, audits every task, revises failures, integrates evidence, and waits for genuine blockers
+- 🔌 **Provider adapter registry** — automatically discovers installed Gemini, OpenCode, Claude/FCC, and Friday CLIs; also supports registered HTTP/MCP adapters and cooperative MCP workers
+- 🧾 **Traceable final reports** — every autonomous result includes the objective, agents involved, tasks, ACK/result/audit evidence, files, tests, warnings, and handoffs
 - 💾 **SQLite backend** — lightweight, no external database required
 - 🛡️ **Zero-trust design** — all services bind to `127.0.0.1` only, no external exposure
 - 🧠 **Shared memory** — any agent can read and write to the shared vault and memory store
@@ -58,6 +61,59 @@ Both components expose **MCP (Model Context Protocol) stdio bridges** for AI age
 No additional pip packages are required for the core Agent Mesh service — it uses only the Python standard library.
 
 See [ORCHESTRATION.md](ORCHESTRATION.md) for the failure diagnosis, shared-runtime deployment, protocol, API, and worker contract.
+
+## Autonomous operation
+
+After the shared runtime is deployed, a substantive request received by any
+MCP-connected agent follows the same workflow:
+
+```text
+one user objective
+        |
+        v
+receiving agent becomes lead
+        |
+        v
+plan -> specialist consultation -> capability routing -> real execution
+        |                                                        |
+        +---------------- audit/revise/retry --------------------+
+        |
+        v
+verified integration -> one final evidence-backed report
+```
+
+The lead calls `agent_mesh_start_autonomous_run` once and waits with
+`agent_mesh_wait_autonomous_run`. The shared supervisor persists the plan and
+task DAG, leases work, sends ACK/result protocol messages, maintains heartbeats,
+reassigns failed work within its retry budget, audits submitted results, and
+integrates only verified task evidence. This applies to research, design,
+coding, testing, security, documentation, deployment, data, and operations
+work; the planner chooses the needed task types.
+
+No per-agent task-bus configuration is needed when the clients already use the
+shared bridge at `~/AI-Second-Brain/.agent_mesh/scripts/agent_mesh_mcp_stdio.py`.
+The MCP initialization instructions carry the lead/wait contract to every
+client. Reload an existing MCP session after deployment. A local CLI with a
+known profile is discovered automatically (including installed Codex and Kilo
+CLIs); an agent with no invokable adapter
+stays a cooperative worker and must poll, ACK, execute, and submit its real
+result. The supervisor reports `WAITING` rather than inventing a response.
+`deploy_shared_runtime.sh` also runs the idempotent client configurator for
+Gemini/Antigravity, Codex, OpenCode, Kilo, Cursor, Windsurf/Cascade, and Kiro;
+existing provider settings are preserved and changed client files are backed
+up under `.agent_mesh/backups/`.
+
+Deployment also imports the canonical vault MCP and skill registries into the
+shared catalog. Only safe metadata and credential references are imported;
+provider execution and secret values remain local to the authorized owner.
+
+All connected clients also share a federated capability catalog. Use
+`agent_mesh_list_shared_capabilities` (or `GET /shared/capabilities`) to see
+the MCP servers/tools and skills published by every agent. To use one, put its
+name in a task's `required_tools` or `required_skills`; the supervisor routes
+that task to the authorized publishing agent. This shares discoverability and
+execution through the owner without copying credentials or silently granting
+another client permissions.
 
 ---
 
@@ -126,6 +182,20 @@ export AGENT_MESH_PORT=17860
 # export MAX_PARALLEL_AGENT_TASKS=8
 # export MAX_DELEGATION_DEPTH=3
 # export AGENT_MESH_REAPER_INTERVAL=1
+
+# Autonomous supervisor settings (safe defaults)
+# export AGENT_MESH_AUTONOMY_ENABLED=1
+# export AGENT_MESH_AUTONOMY_INTERVAL=1
+# export AGENT_MESH_AUTONOMY_MAX_WORKERS=4
+# export AGENT_MESH_AUTONOMY_MAX_ROUNDS=3
+# export AGENT_MESH_AUTONOMY_COMMAND_TIMEOUT=1800
+# Optional identity used by the shared MCP bridge when a caller omits lead_agent
+# export AGENT_MESH_AGENT_NAME=MyAgent
+# Optional default workspace/lead for HTTP callers
+# export AGENT_MESH_WORKSPACE=/path/to/workspace
+# export AGENT_MESH_DEFAULT_LEAD=orchestrator
+# Gemini CLI approval mode used by the built-in adapter
+# export AGENT_MESH_GEMINI_APPROVAL_MODE=yolo
 ```
 
 > 🔑 **Generate secure tokens:** `python3 -c "import secrets; print(secrets.token_hex(32))"`
@@ -149,7 +219,8 @@ bash scripts/start_agent_mesh.sh
 
 ### Shared runtime for every configured agent
 
-Gemini/Antigravity, Codex, and OpenCode use one common bridge under
+Gemini/Antigravity, Codex, OpenCode, Kilo, Cursor, Windsurf/Cascade, and Kiro
+use one common bridge under
 `~/AI-Second-Brain/.agent_mesh/scripts/`. Install the runtime once after
 cloning; individual agents do not need separate orchestration settings:
 
@@ -159,7 +230,11 @@ bash ~/AI-Second-Brain/.agent_mesh/scripts/start_agent_mesh.sh
 ```
 
 Reload an already-open MCP session so it discovers the updated tools. Agents
-remain eligible for assignment only while they publish a current heartbeat.
+with a cooperative GUI worker remain eligible while they publish a current
+heartbeat. Supervisor-owned provider adapters are marked `autonomy_ready` and
+can be invoked without a permanently running GUI session. The runtime itself
+discovers available provider adapters; only custom providers need a one-time
+registration.
 
 ### Option 3: systemd user service (persistent after login)
 
@@ -193,6 +268,45 @@ Add to `~/.bashrc` or `~/.zshrc`:
 ## How Agents Connect With Each Other
 
 All agent-to-agent communication flows through the **Agent Mesh REST API** at `http://127.0.0.1:17860`.
+
+### Start one autonomous objective
+
+The MCP-capable path is the normal path for every substantive request:
+
+```text
+agent_mesh_start_autonomous_run
+  objective: "Build and verify the requested feature"
+  workspace: "/path/to/project"
+  lead_agent: "the receiving agent"   # optional when AGENT_MESH_AGENT_NAME is set
+
+agent_mesh_wait_autonomous_run
+  autonomous_run_id: "returned-id"
+```
+
+The returned report is not considered complete unless the linked run shows
+completed tasks, accepted verification, and final integration. Use
+`agent_mesh_get_autonomous_run` for live progress,
+`agent_mesh_resume_autonomous_run` after a real provider becomes available, and
+`agent_mesh_cancel_autonomous_run` when the objective is no longer wanted.
+
+Useful REST equivalents are:
+
+```bash
+curl -s -X POST http://127.0.0.1:17860/autonomous/runs \
+  -H "Authorization: Bearer ${AGENT_MESH_TOKEN}" \
+  -H "Content-Type: application/json" \
+  -d '{"objective":"Build and verify the requested feature","workspace":"/path/to/project","lead_agent":"MyAgent"}'
+
+curl -s http://127.0.0.1:17860/autonomous/adapters \
+  -H "Authorization: Bearer ${AGENT_MESH_TOKEN}"
+```
+
+`GET /autonomous/adapters` exposes only non-secret adapter metadata. Built-in
+profiles are enabled when their local executable exists. A custom provider can
+be registered once through `agent_mesh_register_agent` (or
+`POST /agents/register`) with an `autonomy_adapter` of kind `command`, `http`,
+or `mcp`; command arguments are tokenized without a shell and credentials are
+referenced by environment-variable name.
 
 ### Agent Registration
 
@@ -265,8 +379,17 @@ Available MCP tools:
 - `agent_mesh_health` — Check service health
 - `agent_mesh_list_agents` — List registered agents
 - `agent_mesh_list_capabilities` — Discover capability and workload metadata
+- `agent_mesh_list_shared_capabilities` — Discover federated agents, MCP tools, and skills
+- `agent_mesh_list_shared_tools` / `agent_mesh_list_shared_skills` — Read the safe shared catalogs
+- `agent_mesh_register_shared_mcp_server` / `agent_mesh_register_shared_skill` — Publish capabilities for the team
 - `agent_mesh_send_message` — Send a message to an agent
 - `agent_mesh_create_handoff` — Create a task handoff request
+- `agent_mesh_register_agent` — Register a custom agent/adapter once for the shared team
+- `agent_mesh_start_autonomous_run` — Start the one-objective lead/planning/execution loop
+- `agent_mesh_wait_autonomous_run` — Wait for verified completion or a genuine blocker
+- `agent_mesh_get_autonomous_run` / `agent_mesh_list_autonomous_runs` — Read durable progress and reports
+- `agent_mesh_resume_autonomous_run` / `agent_mesh_cancel_autonomous_run` — Recover or stop objectives
+- `agent_mesh_list_adapters` — Inspect real CLI/HTTP/MCP/cooperative adapter availability
 - `agent_mesh_create_orchestration_run` — Create an explicit task DAG
 - `agent_mesh_poll_tasks` — Deliver a real task to a worker agent
 - `agent_mesh_ack_task` — Acknowledge or reject a task request
@@ -448,11 +571,20 @@ python3 friday_web.py &
 | POST | `/tasks/{id}/release` | Bearer | Release a task lease |
 | GET | `/tasks/stalled` | Bearer | Get stalled tasks |
 | GET | `/capabilities` | Bearer | Read the capability inventory |
+| GET | `/shared/capabilities` | Bearer | Read federated agents, MCP servers/tools, and skills |
+| GET | `/shared/tools` | Bearer | List safe published tools |
+| GET | `/shared/skills` | Bearer | List safe published skills |
 | POST | `/orchestration/runs` | Bearer | Create and dispatch an explicit task plan |
 | GET | `/orchestration/runs/{id}` | Bearer | Read run state, results, and trace events |
 | POST | `/orchestration/runs/{id}/advance` | Bearer | Reconcile and dispatch runnable tasks |
 | POST | `/orchestration/runs/{id}/finalize` | Bearer | Store the lead's integrated result |
 | POST | `/orchestration/runs/{id}/cancel` | Bearer | Cancel pending and active work |
+| GET | `/autonomous/runs` | Bearer | List high-level autonomous objectives |
+| POST | `/autonomous/runs` | Bearer | Start one objective for autonomous planning and execution |
+| GET | `/autonomous/runs/{id}` | Bearer | Read autonomous state, linked run, evidence, and final report |
+| POST | `/autonomous/runs/{id}/resume` | Bearer | Resume a waiting/blocked objective with new plan or provider context |
+| POST | `/autonomous/runs/{id}/cancel` | Bearer | Cancel an autonomous objective and active delegated work |
+| GET | `/autonomous/adapters` | Bearer | List non-secret real adapter availability |
 | POST | `/tasks/poll` | Bearer | Deliver and lease a request to a worker |
 | POST | `/tasks/{id}/ack` | Bearer | Accept or reject a task request |
 | POST | `/tasks/{id}/progress` | Bearer | Publish progress and refresh activity |
@@ -485,6 +617,10 @@ agent-obsidian-connection/
 │
 ├── scripts/
 │   ├── agent_mesh_core.py         # SQLite state machine and queue
+│   ├── agent_mesh_adapters.py     # Real CLI/HTTP/MCP/cooperative adapter registry
+│   ├── agent_mesh_autonomy.py     # Autonomous planner/worker/audit/integration supervisor
+│   ├── configure_shared_agents.py # Idempotent shared API/MCP client configurator
+│   ├── sync_shared_catalog.py     # Bootstrap canonical vault MCP/skill metadata
 │   ├── agent_mesh_service.py     # Core HTTP server + SQLite backend
 │   ├── agent_mesh_mcp_stdio.py   # MCP stdio bridge for Agent Mesh
 │   ├── obsidian_vault_mcp_stdio.py  # MCP stdio bridge for Obsidian vault
