@@ -95,14 +95,21 @@ No per-agent task-bus configuration is needed when the clients already use the
 shared bridge at `~/AI-Second-Brain/.agent_mesh/scripts/agent_mesh_mcp_stdio.py`.
 The MCP initialization instructions carry the lead/wait contract to every
 client. Reload an existing MCP session after deployment. A local CLI with a
-known profile is discovered automatically (including installed Codex and Kilo
-CLIs); an agent with no invokable adapter
+known profile is discovered automatically (including installed Codex, Cursor,
+Kilo, and Kiro CLIs); an agent with no invokable adapter
 stays a cooperative worker and must poll, ACK, execute, and submit its real
 result. The supervisor reports `WAITING` rather than inventing a response.
 `deploy_shared_runtime.sh` also runs the idempotent client configurator for
 Gemini/Antigravity, Codex, OpenCode, Kilo, Cursor, Windsurf/Cascade, and Kiro;
 existing provider settings are preserved and changed client files are backed
 up under `.agent_mesh/backups/`.
+
+The Cursor and Kiro headless adapters use a completed local CLI login or the
+owner-provided `CURSOR_API_KEY` and `KIRO_API_KEY` references in the service
+environment; Gemini likewise uses its cached Google CLI login, a
+non-interactive API key, or Vertex AI credentials. The service keeps an
+installed-but-unauthenticated CLI queued instead of opening a browser or
+claiming that it can execute unattended.
 
 Deployment also imports the canonical vault MCP and skill registries into the
 shared catalog. Only safe metadata and credential references are imported;

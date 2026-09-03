@@ -28,6 +28,7 @@ from agent_mesh_core import MeshError, MeshStore, Settings, json_value, redact_t
 
 
 MAX_PROVIDER_OUTPUT = 2 * 1024 * 1024
+AUTH_STATUS_CACHE_SECONDS = 15.0
 _ANSI = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]")
 
 
@@ -144,7 +145,29 @@ DEFAULT_PROFILE_CAPABILITIES: dict[str, tuple[str, ...]] = {
         "task_execution",
         "orchestration",
     ),
+    "Cursor": (
+        "analysis",
+        "coding",
+        "frontend",
+        "backend",
+        "filesystem",
+        "shell",
+        "testing",
+        "task_execution",
+        "orchestration",
+    ),
     "Kilo": (
+        "analysis",
+        "coding",
+        "frontend",
+        "backend",
+        "filesystem",
+        "shell",
+        "testing",
+        "task_execution",
+        "orchestration",
+    ),
+    "Kiro": (
         "analysis",
         "coding",
         "frontend",
@@ -168,8 +191,10 @@ DEFAULT_PROFILE_CAPABILITIES: dict[str, tuple[str, ...]] = {
 BUILTIN_AGENT_PROFILES: tuple[tuple[str, str, str], ...] = (
     ("Gemini", "Google", "worker"),
     ("Codex", "OpenAI", "worker"),
+    ("Cursor", "Cursor", "worker"),
     ("OpenCode", "OpenCode", "worker"),
     ("Kilo", "Kilo Code", "worker"),
+    ("Kiro", "Kiro", "worker"),
     ("Claude-FCC", "Anthropic", "worker"),
     ("Friday", "Local", "worker"),
     ("Friday-Fast", "Local", "worker"),
@@ -198,6 +223,128 @@ def _extension_executable(prefix: str, filename: str) -> str:
         if path.is_file() and os.access(path, os.X_OK):
             return str(path)
     return ""
+
+
+def _secret_configured(name: str) -> bool:
+    """Return whether a non-placeholder secret reference is available."""
+    value = os.environ.get(name, "").strip()
+    return bool(value) and value.lower() not in {
+        "your_api_key_here",
+        "your_cursor_api_key_here",
+        "your_kiro_api_key_here",
+        "your_gemini_api_key_here",
+    }
+
+
+def _cli_reports_authenticated(command: tuple[str, ...]) -> bool:
+    """Check a provider's local login state without opening a browser.
+
+    The supervisor runs without a terminal.  Authentication commands must
+    therefore be status-only probes: they may inspect the provider's cached
+    session, but they must never start an interactive login flow or expose its
+    output in the mesh logs.
+    """
+    environment = os.environ.copy()
+    environment["NO_OPEN_BROWSER"] = "1"
+    try:
+        result = subprocess.run(
+            command,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=1.5,
+            env=environment,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False
+    output = (result.stdout or "") + "\n" + (result.stderr or "")
+    lowered = output.lower()
+    unauthenticated_markers = (
+        "not logged in",
+        "not logged-in",
+        "not authenticated",
+        "unauthenticated",
+        "not signed in",
+        "no active session",
+        "authentication required",
+    )
+    return result.returncode == 0 and not any(
+        marker in lowered for marker in unauthenticated_markers
+    )
+
+
+def _secret_tool_credential_present(service: str, account: str) -> bool:
+    """Check for a keyring item without ever emitting its secret value."""
+    executable = _executable("secret-tool")
+    if not executable:
+        return False
+    try:
+        result = subprocess.run(
+            (executable, "lookup", "service", service, "account", account),
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=1.5,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return result.returncode == 0
+
+
+def _gemini_cached_auth_configured() -> bool:
+    """Detect a cached Gemini CLI login without reading credential contents.
+
+    Current Gemini CLI releases keep OAuth tokens in the desktop keychain (or
+    an encrypted file) and keep only the active account marker in
+    ``google_accounts.json``.  The marker alone is not sufficient: a keyring
+    lookup or credential file must also exist, otherwise a stale account
+    marker would make the supervisor launch an unauthenticated process.
+    """
+    base = Path(os.environ.get("GEMINI_CLI_HOME") or Path.home()) / ".gemini"
+    for filename in ("oauth_creds.json", "gemini-credentials.json"):
+        try:
+            if (base / filename).is_file() and (base / filename).stat().st_size > 0:
+                return True
+        except OSError:
+            continue
+    accounts = base / "google_accounts.json"
+    try:
+        data = json.loads(accounts.read_text(encoding="utf-8"))
+    except (OSError, ValueError, TypeError):
+        return False
+    active = data.get("active") if isinstance(data, dict) else None
+    return (
+        isinstance(active, str)
+        and bool(active.strip())
+        and _secret_tool_credential_present("gemini-cli-oauth", "main-account")
+    )
+
+
+def _gemini_headless_auth_configured() -> bool:
+    """Require a non-interactive Gemini authentication path."""
+    if (
+        _secret_configured("GEMINI_API_KEY")
+        or _secret_configured("GOOGLE_API_KEY")
+        or _gemini_cached_auth_configured()
+    ):
+        return True
+    if os.environ.get("GOOGLE_GENAI_USE_VERTEXAI", "").lower() not in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }:
+        return False
+    credentials = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS", "").strip()
+    if credentials and Path(credentials).expanduser().is_file():
+        return True
+    return bool(
+        os.environ.get("GOOGLE_CLOUD_PROJECT", "").strip()
+        and os.environ.get("GOOGLE_CLOUD_LOCATION", "").strip()
+    )
 
 
 def _agent_metadata(agent: dict[str, Any]) -> dict[str, Any]:
@@ -238,6 +385,27 @@ class AdapterRegistry:
         self.store = store
         self.settings = settings
         self._specs: dict[str, AdapterSpec] = {}
+        self._auth_status_cache: dict[str, tuple[float, bool]] = {}
+
+    def _cached_cli_auth(self, cache_key: str, command: tuple[str, ...]) -> bool:
+        """Avoid making provider status checks stall the supervisor loop."""
+        now = time.monotonic()
+        cached = self._auth_status_cache.get(cache_key)
+        if cached and now - cached[0] < AUTH_STATUS_CACHE_SECONDS:
+            return cached[1]
+        authenticated = _cli_reports_authenticated(command)
+        self._auth_status_cache[cache_key] = (now, authenticated)
+        return authenticated
+
+    def _cached_gemini_auth(self) -> bool:
+        """Cache keyring probes while allowing login state to converge."""
+        now = time.monotonic()
+        cached = self._auth_status_cache.get("gemini:auth")
+        if cached and now - cached[0] < AUTH_STATUS_CACHE_SECONDS:
+            return cached[1]
+        configured = _gemini_headless_auth_configured()
+        self._auth_status_cache["gemini:auth"] = (now, configured)
+        return configured
 
     def refresh(self) -> dict[str, AdapterSpec]:
         specs: dict[str, AdapterSpec] = {}
@@ -509,9 +677,9 @@ class AdapterRegistry:
                     "metadata": metadata,
                 }
             )
-        # Kiro is a configured cooperative client but has no verified local
-        # CLI adapter.  Register it once so routing and discovery can queue it
-        # truthfully until its real MCP heartbeat arrives.
+        # Keep Kiro registered even when its CLI is not installed or
+        # authenticated so routing can queue it truthfully until a real CLI
+        # login or MCP heartbeat is present.
         if "Kiro" not in known:
             self.store.register_agent(
                 {
@@ -622,7 +790,7 @@ class AdapterRegistry:
             )
         if name == "Gemini":
             executable = _executable("gemini")
-            if executable:
+            if executable and self._cached_gemini_auth():
                 approval = os.environ.get("AGENT_MESH_GEMINI_APPROVAL_MODE", "yolo")
                 return AdapterSpec(
                     **common,
@@ -639,7 +807,12 @@ class AdapterRegistry:
                     ),
                     model=str(agent.get("model") or ""),
                 )
-            return AdapterSpec(**common, kind="cooperative", reason="gemini CLI is unavailable")
+            reason = (
+                "gemini CLI is unavailable"
+                if not executable
+                else "Gemini CLI requires a cached Google login, GEMINI_API_KEY, GOOGLE_API_KEY, or Vertex AI credentials for unattended execution"
+            )
+            return AdapterSpec(**common, kind="cooperative", reason=reason)
         if name == "Codex":
             executable = _executable("codex") or _extension_executable(
                 "openai.chatgpt", "codex"
@@ -662,6 +835,40 @@ class AdapterRegistry:
                     model=str(agent.get("model") or ""),
                 )
             return AdapterSpec(**common, kind="cooperative", reason="codex CLI is unavailable")
+        if name == "Cursor":
+            executable = _executable(
+                "cursor-agent", str(Path.home() / ".local/bin/cursor-agent")
+            )
+            api_key = _secret_configured("CURSOR_API_KEY")
+            browser_login = bool(executable) and self._cached_cli_auth(
+                "cursor:" + executable,
+                (executable, "status"),
+            )
+            if executable and (api_key or browser_login):
+                return AdapterSpec(
+                    **common,
+                    kind="command",
+                    command=(
+                        executable,
+                        "--print",
+                        "--output-format",
+                        "json",
+                        "--force",
+                        "--trust",
+                        "--approve-mcps",
+                        "--workspace",
+                        "{workspace}",
+                        "{prompt}",
+                    ),
+                    auth_env="CURSOR_API_KEY" if api_key else "",
+                    model=str(agent.get("model") or ""),
+                )
+            reason = (
+                "Cursor CLI is unavailable"
+                if not executable
+                else "Cursor CLI requires CURSOR_API_KEY or a completed cursor-agent login for unattended execution"
+            )
+            return AdapterSpec(**common, kind="cooperative", reason=reason)
         if name == "OpenCode":
             executable = _executable("opencode", str(Path.home() / ".opencode/bin/opencode"))
             if executable:
@@ -702,6 +909,37 @@ class AdapterRegistry:
                     model=str(agent.get("model") or ""),
                 )
             return AdapterSpec(**common, kind="cooperative", reason="kilo CLI is unavailable")
+        if name == "Kiro":
+            executable = _executable(
+                "kiro-cli", str(Path.home() / ".local/bin/kiro-cli")
+            )
+            api_key = _secret_configured("KIRO_API_KEY")
+            browser_login = bool(executable) and self._cached_cli_auth(
+                "kiro:" + executable,
+                (executable, "whoami"),
+            )
+            if executable and (api_key or browser_login):
+                return AdapterSpec(
+                    **common,
+                    kind="command",
+                    command=(
+                        executable,
+                        "chat",
+                        "--no-interactive",
+                        "--trust-all-tools",
+                        "--output-format",
+                        "stream-json",
+                        "{prompt}",
+                    ),
+                    auth_env="KIRO_API_KEY" if api_key else "",
+                    model=str(agent.get("model") or ""),
+                )
+            reason = (
+                "Kiro CLI is unavailable"
+                if not executable
+                else "Kiro CLI requires KIRO_API_KEY or a completed kiro-cli login for unattended execution"
+            )
+            return AdapterSpec(**common, kind="cooperative", reason=reason)
         if "claude" in lower or name == "Claude-FCC":
             executable = _executable("fcc-claude", "claude")
             if executable:

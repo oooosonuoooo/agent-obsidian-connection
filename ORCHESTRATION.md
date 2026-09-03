@@ -159,6 +159,14 @@ the work in its own session, sends progress/heartbeats, and submits the real
 structured result. This is the correct fallback for Codex/IDE clients without
 a safe generic one-shot CLI and preserves truthful completion semantics.
 
+The built-in Cursor and Kiro profiles use their vendor-supported headless
+CLIs when installed and authenticated (`cursor-agent -p` and
+`kiro-cli chat --no-interactive`). They accept either a completed local CLI
+login or an owner-provided API-key environment variable. Missing
+authentication remains queued; the mesh never opens a browser, copies
+credentials, or reports an unverified provider result. Gemini likewise accepts
+a cached Google CLI login, an API key, or Vertex credentials for headless work.
+
 ## Task protocol
 
 1. The lead discovers agents with `GET /agents` or `agent_mesh_list_agents`.
