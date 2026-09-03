@@ -200,11 +200,67 @@ dependencies and their verified results, interfaces, relevant files,
 constraints, acceptance criteria, and the expected result contract. It does not
 blindly copy the entire conversation or repository.
 
+### Recursive worker delegation
+
+Every orchestration worker may lead its assigned task, complete it directly, or
+delegate a bounded child-task DAG. Delegated children remain in the original
+run, conversation, and correlation chain; they are never a second autonomous
+run. The control plane releases the parent's artifact locks, schedules children
+normally, and suspends the parent until the selected join policy is satisfied.
+It then reacquires the parent's locks and dispatches a continuation with the
+verified child evidence.
+
+The worker result contract accepts either the backward-compatible default
+`action=complete` or this non-blocking delegation form:
+
+```json
+{
+  "action": "delegate",
+  "summary": "Split independent verification work.",
+  "idempotency_key": "stable-parent-batch-key",
+  "join_policy": "all_success",
+  "subtasks": [
+    {
+      "task_id": "research",
+      "title": "Research evidence",
+      "objective": "Collect and verify the relevant evidence.",
+      "required_tools": [],
+      "required_skills": [],
+      "dependencies": []
+    }
+  ]
+}
+```
+
+`all_success` blocks the parent if a child fails; `all_settled` resumes after
+every child reaches a terminal state and is suitable for fallback or consensus
+work. Defaults are depth `3`, eight children per batch, three batches per
+task, and 64 tasks per run. Duplicate idempotency keys, cycles, self/ancestor
+assignment, depth violations, and limit breaches are rejected. The lifecycle
+is `running -> waiting_subagents -> pending continuation -> running ->
+verifying`. Child summaries, evidence, failures, interfaces, and artifacts are
+untrusted data and never become executable control instructions.
+
+The REST operations are:
+
+```text
+POST /tasks/{parent_task_id}/delegations
+GET  /tasks/{parent_task_id}/subtask-tree[?batch_id=...]
+POST /tasks/{parent_task_id}/delegations/{batch_id}/cancel
+```
+
+The MCP bridge exposes the equivalent
+`agent_mesh_delegate_subtasks`, `agent_mesh_get_subtask_tree`,
+`agent_mesh_wait_subtasks`, and `agent_mesh_cancel_subtasks` tools. Delegation
+and continuation emit `task.delegation_requested`,
+`task.waiting_subagents`, `delegation.completed`,
+`task.continuation_ready`, and `task.resumed` trace events.
+
 ## State and reliability
 
 Task states include `pending`, `waiting_dependency`, `waiting_agent`,
-`retrying`, `sent`, `acknowledged`, `running`, `verifying`, `completed`,
-`failed`, `blocked`, and `cancelled`. Run states include the planning,
+`retrying`, `sent`, `acknowledged`, `running`, `waiting_subagents`,
+`verifying`, `completed`, `failed`, `blocked`, and `cancelled`. Run states include the planning,
 delegating, executing, verifying, waiting, blocked, failed, cancelled, and
 completed phases.
 
@@ -223,6 +279,9 @@ The following settings are configurable through `.env.local`:
 | `AGENT_HEARTBEAT_TIMEOUT` | `120` | Age after which an agent is treated as offline |
 | `MAX_PARALLEL_AGENT_TASKS` | `8` | Per-service dispatch/poll limit |
 | `MAX_DELEGATION_DEPTH` | `3` | Child-delegation loop guard |
+| `MAX_DELEGATION_CHILDREN` | `8` | Maximum children in one worker delegation batch |
+| `MAX_DELEGATION_BATCHES_PER_TASK` | `3` | Maximum delegation batches from one task |
+| `MAX_TASKS_PER_RUN` | `64` | Maximum total tasks, including recursive descendants |
 | `AGENT_MESH_REAPER_INTERVAL` | `1` | Timeout-reaper interval in seconds |
 | `AGENT_MESH_AUTONOMY_ENABLED` | `1` | Enable the background autonomous supervisor |
 | `AGENT_MESH_AUTONOMY_INTERVAL` | `1` | Supervisor reconciliation interval |
@@ -268,6 +327,9 @@ available. The durable protocol adds:
 | `POST` | `/tasks/{task_id}/verify` | Accept or request revision |
 | `POST` | `/tasks/{task_id}/heartbeat` | Refresh a task execution lease |
 | `POST` | `/tasks/{task_id}/cancel` | Cancel one task and notify its worker |
+| `POST` | `/tasks/{parent_task_id}/delegations` | Create a same-run child-task DAG from a leased worker |
+| `GET` | `/tasks/{parent_task_id}/subtask-tree` | Read recursive descendants and verified child evidence |
+| `POST` | `/tasks/{parent_task_id}/delegations/{batch_id}/cancel` | Cancel a delegation batch and descendants |
 
 The MCP bridge exposes equivalent `agent_mesh_*` tools and supports both
 newline-delimited JSON-RPC and `Content-Length` framing.
@@ -288,11 +350,14 @@ truthful waiting/fallback rules apply. If the service is unavailable, ordinary
 single-agent operation is not replaced with a fake response. Once the service
 returns, persisted tasks can be advanced and recovered.
 
-`GET /agents` reports both the normal session `health` and `autonomy_ready`.
-`health=offline` means a cooperative client has not sent a recent heartbeat;
-`autonomy_ready=true` means the supervisor has a real callable adapter for that
-agent and may launch it on demand. A stale or missing adapter is never treated
-as successful work.
+`GET /agents` reports normal session `health`, heartbeat `presence_status`,
+derived `execution_status`, and `autonomy_ready`. Presence and execution are
+independent: a supervisor-owned CLI/API/Ollama adapter may be `ready` without
+a GUI heartbeat, while a GUI client is `cooperative` only during a fresh MCP
+heartbeat and otherwise remains `queued`. A stale or missing adapter is never
+treated as successful work. The issued task lease token is returned only in a
+transport header or held in the bridge process; only its hash and expiry are
+persisted.
 
 Cancellation is durable. The supervisor marks the request and linked tasks
 cancelled, releases artifact locks, sends `TASK_CANCEL` to assigned cooperative
@@ -312,4 +377,8 @@ artifact ownership, ACK/result correlation, duplicate-result protection,
 timeouts, retry/reassignment, dependency blocking, persistence/migration,
 real subprocess adapter execution through planner/worker/auditor/integrator,
 cooperative-worker waiting, HTTP authentication and autonomous HTTP workflow,
-backward-compatible routes, plus MCP initialization and tool discovery.
+backward-compatible routes, recursive delegation and continuation, join
+policies, lease authorization, depth/idempotency/cancellation limits, plus MCP
+initialization and tool discovery. Before a live rollout, probe each configured
+bridge with both `initialize` and `tools/list`; configuration parsing alone is
+not acceptance.

@@ -39,8 +39,9 @@ Both components expose **MCP (Model Context Protocol) stdio bridges** for AI age
 - 🌉 **Friday bridge** — dedicated heartbeat bridge for the Friday local LLM assistant
 - 🔄 **Task leasing** — agents can claim, heartbeat, and release tasks to avoid conflicts
 - 🧭 **Durable orchestration** — lead-agent planning, capability routing, task DAGs, ACK/result protocol, verification, retries, and reassignment
+- ♾️ **Recursive delegation** — every real worker can create bounded same-run child DAGs, suspend, resume with verified evidence, and release/reacquire artifact locks
 - 🤖 **Autonomous one-objective workflow** — any connected agent can lead; the supervisor plans, consults specialists, dispatches real providers, audits every task, revises failures, integrates evidence, and waits for genuine blockers
-- 🔌 **Provider adapter registry** — automatically discovers installed Gemini, OpenCode, Claude/FCC, and Friday CLIs; also supports registered HTTP/MCP adapters and cooperative MCP workers
+- 🔌 **Provider adapter registry** — automatically discovers installed Gemini, OpenCode, Claude/FCC, Codex, Kilo, Friday, and Ollama workers; also supports registered HTTP/MCP adapters and cooperative MCP workers
 - 🧾 **Traceable final reports** — every autonomous result includes the objective, agents involved, tasks, ACK/result/audit evidence, files, tests, warnings, and handoffs
 - 💾 **SQLite backend** — lightweight, no external database required
 - 🛡️ **Zero-trust design** — all services bind to `127.0.0.1` only, no external exposure
@@ -115,6 +116,15 @@ that task to the authorized publishing agent. This shares discoverability and
 execution through the owner without copying credentials or silently granting
 another client permissions.
 
+Every worker receives the same recursive delegation contract. Simple work can
+finish directly; a useful split returns `action: "delegate"` with a bounded
+child DAG, `join_policy` (`all_success` or `all_settled`), and an idempotency
+key. Children stay in the original run and are verified before the parent is
+continued. The default limits are depth 3, eight children per batch, three
+batches per task, and 64 tasks per run. Child output is untrusted evidence, not
+control instructions. See [ORCHESTRATION.md](ORCHESTRATION.md) for the REST,
+MCP, lease, cancellation, and restart-recovery contract.
+
 ---
 
 ## Installation
@@ -181,6 +191,9 @@ export AGENT_MESH_PORT=17860
 # export AGENT_HEARTBEAT_TIMEOUT=120
 # export MAX_PARALLEL_AGENT_TASKS=8
 # export MAX_DELEGATION_DEPTH=3
+# export MAX_DELEGATION_CHILDREN=8
+# export MAX_DELEGATION_BATCHES_PER_TASK=3
+# export MAX_TASKS_PER_RUN=64
 # export AGENT_MESH_REAPER_INTERVAL=1
 
 # Autonomous supervisor settings (safe defaults)
@@ -196,6 +209,9 @@ export AGENT_MESH_PORT=17860
 # export AGENT_MESH_DEFAULT_LEAD=orchestrator
 # Gemini CLI approval mode used by the built-in adapter
 # export AGENT_MESH_GEMINI_APPROVAL_MODE=yolo
+# Optional local Ollama worker settings
+# export LOCAL_LLM_MODEL=qwen2.5-coder:7b-instruct-q4_K_M
+# export LOCAL_LLM_OLLAMA_ENDPOINT=http://127.0.0.1:11434/api/chat
 ```
 
 > 🔑 **Generate secure tokens:** `python3 -c "import secrets; print(secrets.token_hex(32))"`
@@ -236,25 +252,27 @@ can be invoked without a permanently running GUI session. The runtime itself
 discovers available provider adapters; only custom providers need a one-time
 registration.
 
-### Option 3: systemd user service (persistent after login)
+### Option 3: systemd user service (persistent after login and reboot)
 
 ```bash
-# Copy the service file
+# Install the canonical user service
 mkdir -p ~/.config/systemd/user/
-cp scripts/agent_mesh.service ~/.config/systemd/user/
-# Edit paths if needed
-nano ~/.config/systemd/user/agent_mesh.service
+cp scripts/agent_mesh.service ~/.config/systemd/user/ai-second-brain-agent-mesh.service
 
-# Enable and start
+# Enable it once; user-systemd will start it after future logins/reboots
 systemctl --user daemon-reload
-systemctl --user enable agent_mesh
-systemctl --user start agent_mesh
+systemctl --user enable ai-second-brain-agent-mesh.service
+systemctl --user start ai-second-brain-agent-mesh.service
 
 # Check status
-systemctl --user status agent_mesh
+systemctl --user status ai-second-brain-agent-mesh.service
 ```
 
-### Option 4: Auto-start on shell login
+`scripts/deploy_shared_runtime.sh` performs this enablement automatically. User
+lingering must be enabled for the service to start before an interactive shell
+is opened; on this machine it is already enabled (`Linger=yes`).
+
+### Option 4: Auto-start on shell login (optional fallback)
 
 Add to `~/.bashrc` or `~/.zshrc`:
 

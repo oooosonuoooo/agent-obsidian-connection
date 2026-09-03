@@ -10,8 +10,11 @@ adapters.
 from __future__ import annotations
 
 import json
+import hashlib
+import hmac
 import os
 import re
+import secrets
 import sqlite3
 import uuid
 import urllib.parse
@@ -33,6 +36,7 @@ TASK_STATES = frozenset(
         "sent",
         "acknowledged",
         "running",
+        "waiting_subagents",
         "verifying",
         "completed",
         "failed",
@@ -40,6 +44,8 @@ TASK_STATES = frozenset(
         "cancelled",
     }
 )
+DELEGATION_JOIN_POLICIES = frozenset({"all_success", "all_settled"})
+DELEGATION_BATCH_STATES = frozenset({"open", "completed", "failed", "cancelled"})
 MESSAGE_TYPES = frozenset(
     {
         "TASK_REQUEST",
@@ -115,6 +121,9 @@ class Settings:
     max_delegation_depth: int
     reaper_interval: float
     max_body_bytes: int
+    max_delegation_children: int = 8
+    max_delegation_batches: int = 3
+    max_run_tasks: int = 64
     autonomy_enabled: bool = True
     autonomy_interval: float = 1.0
     autonomy_max_workers: int = 4
@@ -162,7 +171,10 @@ class Settings:
             retry_backoff=number("AGENT_RETRY_BACKOFF", 2.0, 0.0),
             heartbeat_timeout=number("AGENT_HEARTBEAT_TIMEOUT", 120.0, 1.0),
             max_parallel=integer("MAX_PARALLEL_AGENT_TASKS", 8, 1),
-            max_delegation_depth=integer("MAX_DELEGATION_DEPTH", 3, 0),
+            max_delegation_depth=min(integer("MAX_DELEGATION_DEPTH", 3, 0), 3),
+            max_delegation_children=min(integer("MAX_DELEGATION_CHILDREN", 8, 1), 8),
+            max_delegation_batches=min(integer("MAX_DELEGATION_BATCHES_PER_TASK", 3, 1), 3),
+            max_run_tasks=min(integer("MAX_TASKS_PER_RUN", 64, 1), 64),
             reaper_interval=number("AGENT_MESH_REAPER_INTERVAL", 1.0, 0.05),
             max_body_bytes=integer("AGENT_MESH_MAX_BODY_BYTES", 2 * 1024 * 1024, 4096),
             autonomy_enabled=os.environ.get("AGENT_MESH_AUTONOMY_ENABLED", "1").lower()
@@ -317,6 +329,7 @@ class MeshStore:
         self.settings = settings
         self.settings.db.parent.mkdir(parents=True, exist_ok=True)
         self.init_db()
+        self.recover_suspended_delegations()
 
     def connect(self) -> sqlite3.Connection:
         database = sqlite3.connect(
@@ -461,7 +474,31 @@ class MeshStore:
                     error_json TEXT,
                     failed_agents_json TEXT NOT NULL DEFAULT '[]',
                     reassign_on_retry INTEGER NOT NULL DEFAULT 1,
-                    delegation_depth INTEGER NOT NULL DEFAULT 0
+                    delegation_depth INTEGER NOT NULL DEFAULT 0,
+                    delegation_batch_id TEXT,
+                    delegation_state TEXT NOT NULL DEFAULT 'none',
+                    execution_cycle INTEGER NOT NULL DEFAULT 0,
+                    continuation_count INTEGER NOT NULL DEFAULT 0,
+                    retry_count INTEGER NOT NULL DEFAULT 0,
+                    verified_result_ref TEXT,
+                    suspended_at TEXT,
+                    continuation_ready_at TEXT,
+                    lease_token_hash TEXT,
+                    lease_token_expires_at TEXT
+                );
+                CREATE TABLE IF NOT EXISTS delegation_batches (
+                    id TEXT PRIMARY KEY,
+                    run_id TEXT NOT NULL,
+                    parent_task_id INTEGER NOT NULL,
+                    requested_by TEXT NOT NULL,
+                    delegation_depth INTEGER NOT NULL,
+                    join_policy TEXT NOT NULL DEFAULT 'all_success',
+                    state TEXT NOT NULL DEFAULT 'open',
+                    idempotency_key TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    completed_at TEXT,
+                    error_json TEXT NOT NULL DEFAULT '{}'
                 );
                 CREATE TABLE IF NOT EXISTS memory (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -543,6 +580,7 @@ class MeshStore:
                     result_json TEXT,
                     error_json TEXT,
                     idempotency_key TEXT,
+                    execution_cycle INTEGER NOT NULL DEFAULT 0,
                     submitted_at TEXT NOT NULL,
                     verified_at TEXT
                 );
@@ -672,7 +710,22 @@ class MeshStore:
                     "failed_agents_json": "TEXT NOT NULL DEFAULT '[]'",
                     "reassign_on_retry": "INTEGER NOT NULL DEFAULT 1",
                     "delegation_depth": "INTEGER NOT NULL DEFAULT 0",
+                    "delegation_batch_id": "TEXT",
+                    "delegation_state": "TEXT NOT NULL DEFAULT 'none'",
+                    "execution_cycle": "INTEGER NOT NULL DEFAULT 0",
+                    "continuation_count": "INTEGER NOT NULL DEFAULT 0",
+                    "retry_count": "INTEGER NOT NULL DEFAULT 0",
+                    "verified_result_ref": "TEXT",
+                    "suspended_at": "TEXT",
+                    "continuation_ready_at": "TEXT",
+                    "lease_token_hash": "TEXT",
+                    "lease_token_expires_at": "TEXT",
                 },
+            )
+            self._add_missing_columns(
+                database,
+                "task_results",
+                {"execution_cycle": "INTEGER NOT NULL DEFAULT 0"},
             )
             self._add_missing_columns(
                 database,
@@ -763,6 +816,18 @@ class MeshStore:
                 "CREATE UNIQUE INDEX IF NOT EXISTS idx_autonomous_idempotency "
                 "ON autonomous_requests(idempotency_key) "
                 "WHERE idempotency_key IS NOT NULL"
+            )
+            database.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS idx_delegation_idempotency "
+                "ON delegation_batches(parent_task_id, idempotency_key)"
+            )
+            database.execute(
+                "CREATE INDEX IF NOT EXISTS idx_delegation_parent_state "
+                "ON delegation_batches(parent_task_id, state, updated_at)"
+            )
+            database.execute(
+                "CREATE INDEX IF NOT EXISTS idx_tasks_delegation_batch "
+                "ON tasks(delegation_batch_id, status)"
             )
 
     @staticmethod
@@ -870,6 +935,13 @@ class MeshStore:
                 f"status: {task.get('status') or 'pending'}",
                 f"assigned_agent: {task.get('assigned_agent') or 'none'}",
                 f"attempt: {task.get('attempt') or 0}",
+                f"delegation_depth: {task.get('delegation_depth') or 0}",
+                f"delegation_batch_id: {task.get('delegation_batch_id') or 'none'}",
+                f"delegation_state: {task.get('delegation_state') or 'none'}",
+                f"execution_cycle: {task.get('execution_cycle') or 0}",
+                f"continuation_count: {task.get('continuation_count') or 0}",
+                f"suspended_at: {task.get('suspended_at') or 'none'}",
+                f"continuation_ready_at: {task.get('continuation_ready_at') or 'none'}",
                 f"updated_at: {task.get('updated_at') or utc_now()}",
                 "---",
                 f"# Task {task['id']}: {redact_text(task.get('title') or '')}",
@@ -878,6 +950,12 @@ class MeshStore:
                 f"- Lead agent: {redact_text(task.get('lead_agent') or task.get('owner_agent') or 'none')}",
                 f"- Assigned agent: {redact_text(task.get('assigned_agent') or 'none')}",
                 f"- Status: {task.get('status') or 'pending'}",
+                f"- Delegation depth: {task.get('delegation_depth') or 0}",
+                f"- Delegation state: {task.get('delegation_state') or 'none'}",
+                f"- Execution cycle: {task.get('execution_cycle') or 0}",
+                f"- Continuation count: {task.get('continuation_count') or 0}",
+                f"- Suspended at: {task.get('suspended_at') or 'none'}",
+                f"- Continuation ready at: {task.get('continuation_ready_at') or 'none'}",
                 f"- Waiting reason: {redact_text(task.get('waiting_reason') or 'none')}",
                 f"- Context path: {redact_text(task.get('context_path') or 'none')}",
                 f"- Result path: {redact_text(task.get('result_path') or 'none')}",
@@ -963,6 +1041,35 @@ class MeshStore:
         if declared == "degraded" or status == "degraded":
             return "degraded"
         return "online"
+
+    def presence_status(
+        self, agent: dict[str, Any], at: datetime | None = None
+    ) -> str:
+        """Report client heartbeat presence independently from adapter readiness."""
+        if str(agent.get("name") or "") == "orchestrator":
+            return "control_plane"
+        status = str(agent.get("status") or "").lower()
+        if status in {"offline", "disabled", "unavailable"}:
+            return "offline"
+        seen = parse_time(agent.get("last_seen_at"))
+        at = at or datetime.now(timezone.utc)
+        if seen is None or (at - seen).total_seconds() > self.settings.heartbeat_timeout:
+            return "offline"
+        return "online"
+
+    def execution_status(self, agent: dict[str, Any]) -> str:
+        """Report whether the supervisor can invoke this agent right now."""
+        metadata = agent.get("metadata")
+        if not isinstance(metadata, dict):
+            metadata = json_value(agent.get("metadata_json"), {})
+        autonomy = metadata.get("autonomy") if isinstance(metadata, dict) else None
+        if str(agent.get("name") or "") == "orchestrator":
+            return "control_plane"
+        if isinstance(autonomy, dict) and autonomy.get("available") is True:
+            return "ready"
+        if self.presence_status(agent) == "online":
+            return "cooperative"
+        return "queued"
 
     def register_agent(self, data: dict[str, Any]) -> dict[str, Any]:
         name = nonempty_text(data.get("name"), "name", 200)
@@ -1070,6 +1177,80 @@ class MeshStore:
         self.sync_agent(row)
         return self.decorate_agent(row)
 
+    def update_agent_adapter_state(
+        self,
+        name: str,
+        *,
+        available: bool,
+        adapter_kind: str,
+        adapter_source: str,
+        capabilities: list[str] | tuple[str, ...] = (),
+        endpoint: str = "",
+        model: str = "",
+    ) -> dict[str, Any] | None:
+        """Refresh supervisor readiness without inventing client presence."""
+        with self.transaction() as database:
+            row = self._dict(database.execute("SELECT * FROM agents WHERE name=?", (name,)).fetchone())
+            if row is None:
+                return None
+            metadata = json_value(row.get("metadata_json"), {})
+            if not isinstance(metadata, dict):
+                metadata = {}
+            metadata = dict(metadata)
+            autonomy = metadata.get("autonomy")
+            if not isinstance(autonomy, dict):
+                autonomy = {}
+            autonomy = dict(autonomy)
+            autonomy.update(
+                {
+                    "adapter_kind": redact_text(adapter_kind),
+                    "adapter_source": redact_text(adapter_source),
+                    "available": bool(available),
+                }
+            )
+            metadata["autonomy"] = autonomy
+            current_capabilities = json_value(row.get("capabilities_json"), {})
+            if not isinstance(current_capabilities, dict):
+                current_capabilities = {}
+            current_capabilities = dict(current_capabilities)
+            for capability in capabilities:
+                current_capabilities.setdefault(str(capability), True)
+            if available:
+                current_capabilities["autonomous_worker"] = True
+            health = "online" if available else "offline"
+            next_endpoint = redact_text(endpoint or row.get("endpoint") or "")
+            next_model = redact_text(model or row.get("model") or "")
+            next_metadata = json_text(metadata, {})
+            next_capabilities = json_text(current_capabilities, {})
+            unchanged = (
+                next_metadata == str(row.get("metadata_json") or "")
+                and next_capabilities == str(row.get("capabilities_json") or "")
+                and health == str(row.get("health") or "")
+                and next_endpoint == str(row.get("endpoint") or "")
+                and next_model == str(row.get("model") or "")
+            )
+            if not unchanged:
+                database.execute(
+                    """
+                    UPDATE agents SET endpoint=?, model=?, health=?,
+                        capabilities_json=?, metadata_json=?
+                    WHERE name=?
+                    """,
+                    (
+                        next_endpoint,
+                        next_model,
+                        health,
+                        next_capabilities,
+                        next_metadata,
+                        name,
+                    ),
+                )
+                row = self._dict(database.execute("SELECT * FROM agents WHERE name=?", (name,)).fetchone())
+        assert row is not None
+        if not unchanged:
+            self.sync_agent(row)
+        return self.decorate_agent(row)
+
     def get_agent(self, name: str) -> dict[str, Any]:
         with self.connect() as database:
             row = self._dict(database.execute("SELECT * FROM agents WHERE name=?", (name,)).fetchone())
@@ -1096,6 +1277,8 @@ class MeshStore:
         for agent in agents:
             assert agent is not None
             agent["health"] = self.agent_health(agent)
+            agent["presence_status"] = self.presence_status(agent)
+            agent["execution_status"] = self.execution_status(agent)
             agent["active_task_count"] = int(loads.get(agent["name"], 0))
             agent["capabilities"] = json_value(agent.get("capabilities_json"), {})
             agent["metadata"] = json_value(agent.get("metadata_json"), {})
@@ -1112,6 +1295,8 @@ class MeshStore:
     def decorate_agent(self, agent: dict[str, Any]) -> dict[str, Any]:
         result = dict(agent)
         result["health"] = self.agent_health(result)
+        result["presence_status"] = self.presence_status(result)
+        result["execution_status"] = self.execution_status(result)
         result["capabilities"] = json_value(result.get("capabilities_json"), {})
         result["metadata"] = json_value(result.get("metadata_json"), {})
         result["tools"] = result["metadata"].get("tools", [])
@@ -1365,6 +1550,10 @@ class MeshStore:
     @staticmethod
     def _task_json_fields(task: dict[str, Any]) -> dict[str, Any]:
         result = dict(task)
+        # Lease material is control-plane data and must never be exposed to
+        # agents, vault notes, or normal REST responses.
+        result.pop("lease_token_hash", None)
+        result.pop("lease_token_expires_at", None)
         mappings = {
             "required_capabilities_json": "required_capabilities",
             "required_tools_json": "required_tools",
@@ -1573,6 +1762,11 @@ class MeshStore:
         conversation_id: str | None = None,
         reassign_on_retry: bool = True,
         delegation_depth: int = 0,
+        delegation_batch_id: str | None = None,
+        delegation_state: str = "none",
+        execution_cycle: int = 0,
+        continuation_count: int = 0,
+        retry_count: int = 0,
         project: str | None = None,
         context_path: str | None = None,
         result_path: str | None = None,
@@ -1645,6 +1839,22 @@ class MeshStore:
             ),
         )
         task_id = int(database.execute("SELECT last_insert_rowid()").fetchone()[0])
+        database.execute(
+            """
+            UPDATE tasks
+            SET delegation_batch_id=?, delegation_state=?, execution_cycle=?,
+                continuation_count=?, retry_count=?
+            WHERE id=?
+            """,
+            (
+                redact_text(delegation_batch_id or "") or None,
+                redact_text(delegation_state or "none"),
+                max(int(execution_cycle), 0),
+                max(int(continuation_count), 0),
+                max(int(retry_count), 0),
+                task_id,
+            ),
+        )
         row = database.execute("SELECT * FROM tasks WHERE id=?", (task_id,)).fetchone()
         assert row is not None
         return dict(row)
@@ -1813,12 +2023,24 @@ class MeshStore:
         exclude: set[str] | None = None,
     ) -> dict[str, Any] | None:
         exclude = {str(item) for item in (exclude or set())}
+        # A descendant cannot be routed back through its current worker or an
+        # ancestor worker.  This prevents recursive cycles while preserving a
+        # truthful waiting_agent state when no other eligible provider exists.
+        if task.get("parent_task_id"):
+            for ancestor in self._ancestor_tasks_locked(database, int(task["id"])):
+                if ancestor.get("assigned_agent"):
+                    exclude.add(str(ancestor["assigned_agent"]))
+        exclude.add("orchestrator")
         required = [str(item).lower() for item in json_value(task.get("required_capabilities_json"), [])]
         required_tools = [str(item).lower() for item in json_value(task.get("required_tools_json"), [])]
         required_skills = [str(item).lower() for item in json_value(task.get("required_skills_json"), [])]
         candidates = json_value(task.get("candidate_agents_json"), [])
         explicit = str(task.get("assigned_agent") or "")
-        if explicit and int(task.get("attempt") or 0) == 0:
+        if explicit and task.get("delegation_state") == "resume":
+            # Continuation belongs to the worker that requested the batch;
+            # normal failures are still allowed to reassign on retry.
+            candidates = [explicit]
+        elif explicit and int(task.get("attempt") or 0) == 0:
             candidates = [explicit]
         elif explicit and not int(task.get("reassign_on_retry") or 0):
             candidates = [explicit]
@@ -1827,7 +2049,7 @@ class MeshStore:
         else:
             allowed = None
         rows = [dict(row) for row in database.execute("SELECT * FROM agents ORDER BY name")]
-        ranked: list[tuple[tuple[int, int, int, str], dict[str, Any]]] = []
+        ranked: list[tuple[tuple[int, int, int, int, int, str], dict[str, Any]]] = []
         at = datetime.now(timezone.utc)
         for agent in rows:
             name = str(agent["name"])
@@ -1956,6 +2178,45 @@ class MeshStore:
                     "result": json_value(dependency.get("result_json"), {}),
                 }
             )
+        subagent_results: list[dict[str, Any]] = []
+        batches = database.execute(
+            "SELECT * FROM delegation_batches WHERE parent_task_id=? ORDER BY created_at, id",
+            (task["id"],),
+        ).fetchall()
+        for batch in batches:
+            child_rows = database.execute(
+                "SELECT * FROM tasks WHERE delegation_batch_id=? ORDER BY id",
+                (batch["id"],),
+            ).fetchall()
+            for child in child_rows:
+                child_dict = dict(child)
+                verified = child_dict.get("status") == "completed"
+                subagent_results.append(
+                    {
+                        "batch_id": batch["id"],
+                        "batch_state": batch["state"],
+                        "join_policy": batch["join_policy"],
+                        "task_id": child_dict.get("task_key") or child_dict["id"],
+                        "database_task_id": child_dict["id"],
+                        "title": child_dict.get("title") or "",
+                        "status": child_dict.get("status") or "pending",
+                        "agent": child_dict.get("assigned_agent") or "",
+                        "provider": child_dict.get("assigned_provider") or "",
+                        "model": child_dict.get("assigned_model") or "",
+                        "verified_result_ref": child_dict.get("verified_result_ref")
+                        if verified
+                        else None,
+                        # Child output is explicitly data.  It is never
+                        # interpolated into the worker's executable prompt by
+                        # the control plane.
+                        "result": json_value(child_dict.get("result_json"), {})
+                        if verified
+                        else {},
+                        "error": json_value(child_dict.get("error_json"), {})
+                        if child_dict.get("status") in TASK_TERMINAL
+                        else {},
+                    }
+                )
         project_goal = ""
         if task.get("run_id"):
             run = database.execute(
@@ -1965,6 +2226,8 @@ class MeshStore:
             if run is not None:
                 project_goal = run["request"] or ""
         return {
+            "protocol": "task-request-v2",
+            "protocol_version": 2,
             "task_id": task.get("task_key") or task["id"],
             "database_task_id": task["id"],
             "run_id": task.get("run_id") or None,
@@ -1972,6 +2235,11 @@ class MeshStore:
             "conversation_id": task.get("conversation_id") or task.get("run_id") or None,
             "correlation_id": task.get("correlation_id") or task.get("task_key"),
             "parent_task_id": task.get("parent_task_id"),
+            "delegation_batch_id": task.get("delegation_batch_id"),
+            "delegation_depth": int(task.get("delegation_depth") or 0),
+            "delegation_state": task.get("delegation_state") or "none",
+            "execution_cycle": int(task.get("execution_cycle") or 0),
+            "continuation_count": int(task.get("continuation_count") or 0),
             "title": task["title"],
             "description": task.get("description") or "",
             "project": task.get("project") or "",
@@ -1987,6 +2255,16 @@ class MeshStore:
             "constraints": task.get("constraints") or "",
             "input": json_value(task.get("input_json"), {}),
             "previous_error": json_value(task.get("error_json"), {}),
+            "subagent_results": subagent_results,
+            "delegation": {
+                "enabled": bool(task.get("run_id")),
+                "max_depth": self.settings.max_delegation_depth,
+                "max_children": self.settings.max_delegation_children,
+                "max_batches": self.settings.max_delegation_batches,
+                "join_policies": sorted(DELEGATION_JOIN_POLICIES),
+                "same_run": True,
+                "result_data_is_untrusted": True,
+            },
             "verification_status": task.get("verification_status") or "pending",
             "expected_result": {
                 "summary": "string",
@@ -1997,6 +2275,10 @@ class MeshStore:
                 "warnings": "list",
                 "errors": "list",
                 "handoff_notes": "list",
+                "action": "complete or delegate",
+                "subtasks": "list when action is delegate",
+                "join_policy": "all_success or all_settled when action is delegate",
+                "idempotency_key": "string when action is delegate",
             },
         }
 
@@ -2011,7 +2293,8 @@ class MeshStore:
     ) -> str:
         stamp = utc_now()
         current_attempt = int(task.get("attempt") or 0)
-        max_total = int(task.get("max_retries") or 0) + 1
+        retry_count = int(task.get("retry_count") or 0)
+        max_retries = int(task.get("max_retries") or 0)
         error = reason if isinstance(reason, dict) else {"message": str(reason)}
         failed_agents = json_value(task.get("failed_agents_json"), [])
         assigned = task.get("assigned_agent")
@@ -2026,13 +2309,14 @@ class MeshStore:
             """,
             (redact_text(json.dumps(sanitize(error), sort_keys=True)), stamp, task["id"], current_attempt),
         )
-        if current_attempt >= max_total:
+        if retry_count >= max_retries:
             database.execute(
                 """
                 UPDATE tasks
                 SET status='failed', error_json=?, failed_agents_json=?, failed_at=?,
                     verification_status='rejected', updated_at=?, waiting_reason=?,
-                    lease_owner=NULL, lease_expires_at=NULL
+                    lease_owner=NULL, lease_expires_at=NULL,
+                    lease_token_hash=NULL, lease_token_expires_at=NULL
                 WHERE id=?
                 """,
                 (
@@ -2052,6 +2336,10 @@ class MeshStore:
                 (task["id"], current_attempt),
             )
             self._release_artifacts(database, int(task["id"]))
+            if task.get("parent_task_id"):
+                self._settle_delegation_batches_locked(
+                    database, int(task["parent_task_id"])
+                )
             final_status = "failed"
         else:
             next_time = after(
@@ -2066,8 +2354,9 @@ class MeshStore:
                     assigned_agent=CASE WHEN ? THEN NULL ELSE assigned_agent END,
                     ack_at=NULL, started_at=NULL, sent_at=NULL, result_received_at=NULL,
                     lease_owner=NULL, lease_expires_at=NULL,
+                    lease_token_hash=NULL, lease_token_expires_at=NULL,
                     last_heartbeat_at=NULL, last_active_agent=NULL,
-                    verification_status='revision_required'
+                    verification_status='revision_required', retry_count=retry_count+1
                 WHERE id=?
                 """,
                 (
@@ -2123,6 +2412,11 @@ class MeshStore:
                     task = dict(task_row)
                     if task["status"] not in {"pending", "retrying", "waiting_agent", "waiting_dependency"}:
                         continue
+                    active_count = database.execute(
+                        "SELECT COUNT(*) FROM tasks WHERE status IN ('sent','acknowledged','running','verifying')"
+                    ).fetchone()[0]
+                    if int(active_count) >= self.settings.max_parallel:
+                        continue
                     dependencies = self._dependencies(database, int(task["id"]))
                     if any(item["status"] in {"failed", "blocked", "cancelled"} for item in dependencies):
                         database.execute(
@@ -2137,6 +2431,10 @@ class MeshStore:
                             task_id=task["id"],
                             payload={"reason": "dependency failed"},
                         )
+                        if task.get("parent_task_id"):
+                            self._settle_delegation_batches_locked(
+                                database, int(task["parent_task_id"])
+                            )
                         continue
                     if any(item["status"] != "completed" for item in dependencies):
                         database.execute(
@@ -2150,9 +2448,6 @@ class MeshStore:
                             "UPDATE tasks SET status='waiting_dependency', waiting_reason=?, updated_at=? WHERE id=?",
                             (reason, utc_now(), task["id"]),
                         )
-                        continue
-                    if int(task.get("attempt") or 0) >= int(task.get("max_retries") or 0) + 1:
-                        self._queue_retry_locked(database, task, {"message": "retry limit exhausted"})
                         continue
                     failed_agents = set(json_value(task.get("failed_agents_json"), []))
                     agent = self._select_agent(database, task, failed_agents)
@@ -2179,7 +2474,10 @@ class MeshStore:
                         SET assigned_agent=?, assigned_provider=?, assigned_model=?,
                             status='sent', attempt=?, sent_at=?, updated_at=?,
                             waiting_reason=NULL, next_attempt_at=NULL,
-                            verification_status='pending'
+                            verification_status='pending',
+                            execution_cycle=execution_cycle+1,
+                            delegation_state=CASE WHEN delegation_state='resume' THEN 'none' ELSE delegation_state END,
+                            lease_token_hash=NULL, lease_token_expires_at=NULL
                         WHERE id=?
                         """,
                         (
@@ -2208,7 +2506,10 @@ class MeshStore:
                         correlation_id=fresh.get("correlation_id") or fresh.get("task_key"),
                         conversation_id=fresh.get("conversation_id") or fresh.get("run_id"),
                         attempt=attempt,
-                        max_attempts=int(fresh.get("max_retries") or 0) + 1,
+                        max_attempts=max(
+                            int(fresh.get("max_retries") or 0) + 1,
+                            attempt,
+                        ),
                         idempotency_key=f"{fresh.get('idempotency_key') or fresh.get('task_key')}:{attempt}",
                         status="queued",
                     )
@@ -2226,6 +2527,18 @@ class MeshStore:
                             "attempt": attempt,
                         },
                     )
+                    if task.get("delegation_state") == "resume":
+                        self._event(
+                            database,
+                            "task.resumed",
+                            actor=agent_name,
+                            run_id=fresh.get("run_id") or None,
+                            task_id=fresh["id"],
+                            payload={
+                                "execution_cycle": fresh.get("execution_cycle") or 0,
+                                "continuation_count": fresh.get("continuation_count") or 0,
+                            },
+                        )
                     dispatched.append(
                         {
                             "task": self.decorate_task(fresh),
@@ -2294,6 +2607,24 @@ class MeshStore:
                 task = self._dict(database.execute("SELECT * FROM tasks WHERE id=?", (task_id,)).fetchone())
                 if message is None or task is None:
                     continue
+                task_token = self._new_lease_token()
+                database.execute(
+                    """
+                    UPDATE tasks
+                    SET lease_token_hash=?, lease_token_expires_at=?,
+                        lease_owner=?, lease_expires_at=?
+                    WHERE id=? AND assigned_agent=? AND status='sent'
+                    """,
+                    (
+                        self._lease_hash(task_token),
+                        lease,
+                        agent,
+                        lease,
+                        task_id,
+                        agent,
+                    ),
+                )
+                task = self._dict(database.execute("SELECT * FROM tasks WHERE id=?", (task_id,)).fetchone())
                 self._event(
                     database,
                     "task.delivered",
@@ -2308,6 +2639,9 @@ class MeshStore:
                         "task": self.decorate_task(task),
                         "message": self.decorate_message(message),
                         "execution": json_value(message.get("payload_json"), {}),
+                        # The service turns this into a response header and
+                        # the MCP bridge keeps it in memory only.
+                        "lease_token": task_token,
                     }
                 )
         return result
@@ -2324,6 +2658,7 @@ class MeshStore:
         with self.transaction() as database:
             task = self._task_row(database, reference)
             agent = self._validate_agent_for_task(task, data.get("agent") or data.get("agent_id"))
+            self._validate_worker_mutation_lease(database, task, agent, data)
             accepted = bool(data.get("accepted", True))
             message_id = data.get("message_id")
             stamp = utc_now()
@@ -2449,6 +2784,7 @@ class MeshStore:
             task = self._task_row(database, reference)
             previous_status = task["status"]
             agent = self._validate_agent_for_task(task, data.get("agent") or data.get("agent_id"))
+            self._validate_worker_mutation_lease(database, task, agent, data)
             if task["status"] in TASK_TERMINAL:
                 raise MeshError(f"task is already {task['status']}", 409)
             if task["status"] == "sent":
@@ -2520,6 +2856,7 @@ class MeshStore:
         with self.transaction() as database:
             task = self._task_row(database, reference)
             agent = self._validate_agent_for_task(task, data.get("agent") or data.get("agent_id"))
+            self._validate_worker_mutation_lease(database, task, agent, data)
             if task["status"] in TASK_TERMINAL:
                 raise MeshError(f"task is already {task['status']}", 409)
             legacy_heartbeat = not task.get("run_id")
@@ -2532,12 +2869,13 @@ class MeshStore:
             database.execute(
                 """
                 UPDATE tasks SET last_heartbeat_at=?, last_active_agent=?,
-                    lease_expires_at=?, updated_at=?
+                    lease_expires_at=?, lease_token_expires_at=?, updated_at=?
                 WHERE id=?
                 """,
                 (
                     stamp,
                     agent,
+                    after(float(task.get("execution_timeout_seconds") or self.settings.execution_timeout)),
                     after(float(task.get("execution_timeout_seconds") or self.settings.execution_timeout)),
                     stamp,
                     task["id"],
@@ -2561,10 +2899,14 @@ class MeshStore:
     def _validate_result(self, result: Any) -> dict[str, Any]:
         if not isinstance(result, dict):
             raise MeshError("result must be an object")
+        action = str(result.get("action") or "complete").strip().lower()
+        if action not in {"complete", "delegate"}:
+            raise MeshError("result.action must be complete or delegate")
         summary = str(result.get("summary") or "").strip()
         if not summary:
             raise MeshError("result.summary is required")
         result = dict(result)
+        result["action"] = action
         result["summary"] = summary
         for field in (
             "files_changed",
@@ -2577,13 +2919,726 @@ class MeshStore:
         ):
             if field in result and not isinstance(result[field], list):
                 raise MeshError(f"result.{field} must be a list")
+        if action == "delegate":
+            subtasks = result.get("subtasks") or result.get("tasks")
+            if not isinstance(subtasks, list) or not subtasks:
+                raise MeshError("delegated result requires a non-empty subtasks list")
+            if len(subtasks) > self.settings.max_delegation_children:
+                raise MeshError("delegated result exceeds the child-task limit")
+            if not nonempty_text(
+                result.get("idempotency_key"), "result.idempotency_key", 500
+            ):
+                raise MeshError("delegated result requires idempotency_key")
+            result["subtasks"] = subtasks
+            result["join_policy"] = str(
+                result.get("join_policy") or "all_success"
+            ).strip().lower()
         return sanitize(result)
+
+    @staticmethod
+    def _lease_hash(token: str) -> str:
+        return hashlib.sha256(token.encode("utf-8")).hexdigest()
+
+    @staticmethod
+    def _new_lease_token() -> str:
+        return secrets.token_urlsafe(32)
+
+    def _validate_task_lease(
+        self,
+        database: sqlite3.Connection,
+        task: dict[str, Any],
+        agent: str,
+        token: str | None = None,
+        *,
+        required: bool = False,
+    ) -> None:
+        assigned = str(task.get("assigned_agent") or "")
+        if assigned and assigned != agent:
+            raise MeshError("agent is not assigned to this task", 409)
+        stored = str(task.get("lease_token_hash") or "")
+        expires = parse_time(task.get("lease_token_expires_at"))
+        if stored:
+            if not token or not hmac.compare_digest(stored, self._lease_hash(token)):
+                raise MeshError("active task lease is required", 403)
+            if expires is not None and expires <= datetime.now(timezone.utc):
+                raise MeshError("task lease has expired", 409)
+        elif required and not assigned:
+            raise MeshError("task must be assigned before delegation", 409)
+
+    def _validate_worker_mutation_lease(
+        self,
+        database: sqlite3.Connection,
+        task: dict[str, Any],
+        agent: str,
+        data: dict[str, Any],
+    ) -> None:
+        """Require the scoped token once a task has been delivered.
+
+        Older in-process/v1 callers may acknowledge a task immediately after
+        dispatch, before a poll lease exists. Once polling issues a token,
+        every worker mutation must present that same token.
+        """
+        if not task.get("lease_token_hash"):
+            return
+        token = data.get("_lease_token") or data.get("lease_token")
+        # A body-only call is the legacy v1 compatibility path. New bridge
+        # calls carry caller identity and the scoped token in transport
+        # metadata; an explicitly supplied token is also always validated.
+        if not token and not data.get("_caller_agent"):
+            return
+        self._validate_task_lease(
+            database, task, agent, str(token) if token else None, required=True
+        )
+
+    def _ancestor_tasks_locked(
+        self, database: sqlite3.Connection, task_id: int
+    ) -> list[dict[str, Any]]:
+        result: list[dict[str, Any]] = []
+        seen: set[int] = set()
+        current = task_id
+        while current and current not in seen:
+            seen.add(current)
+            row = database.execute(
+                "SELECT * FROM tasks WHERE id=?", (current,)
+            ).fetchone()
+            if row is None:
+                break
+            task = dict(row)
+            parent = task.get("parent_task_id")
+            if parent in (None, "", 0):
+                break
+            parent_row = database.execute(
+                "SELECT * FROM tasks WHERE id=?", (int(parent),)
+            ).fetchone()
+            if parent_row is None:
+                break
+            parent_task = dict(parent_row)
+            result.append(parent_task)
+            current = int(parent_task["id"])
+        return result
+
+    def _descendant_tasks_locked(
+        self, database: sqlite3.Connection, task_id: int
+    ) -> list[dict[str, Any]]:
+        """Return every descendant in the same run, breadth-first."""
+        descendants: list[dict[str, Any]] = []
+        frontier = [int(task_id)]
+        seen: set[int] = set()
+        while frontier:
+            placeholders = ",".join("?" for _ in frontier)
+            rows = [
+                dict(row)
+                for row in database.execute(
+                    f"SELECT * FROM tasks WHERE parent_task_id IN ({placeholders}) ORDER BY id",
+                    frontier,
+                )
+            ]
+            frontier = []
+            for row in rows:
+                row_id = int(row["id"])
+                if row_id in seen:
+                    continue
+                seen.add(row_id)
+                descendants.append(row)
+                frontier.append(row_id)
+        return descendants
+
+    def _settle_delegation_batches_locked(
+        self, database: sqlite3.Connection, parent_task_id: int
+    ) -> None:
+        batches = database.execute(
+            "SELECT * FROM delegation_batches WHERE parent_task_id=? AND state='open'",
+            (parent_task_id,),
+        ).fetchall()
+        for batch_row in batches:
+            batch = dict(batch_row)
+            children = [
+                dict(row)
+                for row in database.execute(
+                    "SELECT * FROM tasks WHERE delegation_batch_id=? ORDER BY id",
+                    (batch["id"],),
+                )
+            ]
+            if not children:
+                continue
+            statuses = {str(child.get("status") or "pending") for child in children}
+            all_completed = statuses == {"completed"}
+            all_terminal = all(
+                status in TASK_TERMINAL for status in statuses
+            )
+            failed = statuses & {"failed", "blocked", "cancelled"}
+            policy = str(batch.get("join_policy") or "all_success")
+            if not all_completed and not (
+                policy == "all_settled" and all_terminal
+            ) and not (policy == "all_success" and failed):
+                continue
+
+            stamp = utc_now()
+            if policy == "all_success" and failed:
+                database.execute(
+                    """
+                    UPDATE delegation_batches
+                    SET state='failed', updated_at=?, completed_at=?, error_json=?
+                    WHERE id=? AND state='open'
+                    """,
+                    (
+                        stamp,
+                        stamp,
+                        json_text(
+                            {
+                                "message": "one or more delegated subtasks failed",
+                                "statuses": sorted(statuses),
+                            },
+                            {},
+                        ),
+                        batch["id"],
+                    ),
+                )
+                database.execute(
+                    """
+                    UPDATE tasks
+                    SET status='blocked', delegation_state='none',
+                        waiting_reason=?, error_json=?, updated_at=?
+                    WHERE id=? AND status='waiting_subagents'
+                    """,
+                    (
+                        "delegated subtasks did not all complete successfully",
+                        json_text(
+                            {"message": "delegation batch failed", "batch_id": batch["id"]},
+                            {},
+                        ),
+                        stamp,
+                        parent_task_id,
+                    ),
+                )
+                self._event(
+                    database,
+                    "delegation.failed",
+                    actor=batch.get("requested_by"),
+                    run_id=batch.get("run_id"),
+                    task_id=parent_task_id,
+                    payload={"batch_id": batch["id"], "statuses": sorted(statuses)},
+                )
+                continue
+
+            database.execute(
+                """
+                UPDATE delegation_batches
+                SET state='completed', updated_at=?, completed_at=?
+                WHERE id=? AND state='open'
+                """,
+                (stamp, stamp, batch["id"]),
+            )
+            database.execute(
+                """
+                UPDATE tasks
+                SET status='pending', delegation_state='resume',
+                    continuation_count=continuation_count+1,
+                    waiting_reason=NULL, continuation_ready_at=?, updated_at=?
+                WHERE id=? AND status='waiting_subagents'
+                """,
+                (stamp, stamp, parent_task_id),
+            )
+            self._event(
+                database,
+                "delegation.completed",
+                actor=batch.get("requested_by"),
+                run_id=batch.get("run_id"),
+                task_id=parent_task_id,
+                payload={
+                    "batch_id": batch["id"],
+                    "join_policy": policy,
+                    "child_count": len(children),
+                },
+            )
+            self._event(
+                database,
+                "task.continuation_ready",
+                actor=batch.get("requested_by"),
+                run_id=batch.get("run_id"),
+                task_id=parent_task_id,
+                payload={"batch_id": batch["id"]},
+            )
+
+    def recover_suspended_delegations(self) -> int:
+        """Reconcile parents left waiting across a service restart."""
+        run_ids: set[str] = set()
+        with self.transaction() as database:
+            parents = database.execute(
+                "SELECT * FROM tasks WHERE status='waiting_subagents'"
+            ).fetchall()
+            for row in parents:
+                parent = dict(row)
+                self._settle_delegation_batches_locked(database, int(parent["id"]))
+                if parent.get("run_id"):
+                    run_ids.add(str(parent["run_id"]))
+        for run_id in run_ids:
+            self.dispatch_runnable(run_id)
+            self.reconcile_run(run_id)
+        return len(run_ids)
+
+    def delegate_subtasks(self, reference: Any, data: dict[str, Any]) -> dict[str, Any]:
+        """Atomically suspend a worker and create a bounded child-task batch."""
+        raw_tasks = data.get("tasks") or data.get("subtasks")
+        if not isinstance(raw_tasks, list) or not raw_tasks:
+            raise MeshError("tasks must be a non-empty list")
+        if len(raw_tasks) > self.settings.max_delegation_children:
+            raise MeshError("delegation batch exceeds the child-task limit")
+        join_policy = str(data.get("join_policy") or "all_success").strip().lower()
+        if join_policy not in DELEGATION_JOIN_POLICIES:
+            raise MeshError("join_policy must be all_success or all_settled")
+        idempotency_key = nonempty_text(
+            data.get("idempotency_key"), "idempotency_key", 500
+        )
+        caller = nonempty_text(
+            data.get("_caller_agent")
+            or data.get("agent")
+            or data.get("requested_by"),
+            "agent",
+            200,
+        )
+        token = data.get("_lease_token") or data.get("lease_token")
+        child_rows: list[dict[str, Any]] = []
+        batch: dict[str, Any]
+        parent: dict[str, Any]
+        with self.transaction() as database:
+            parent = self._task_row(database, reference)
+            if not parent.get("run_id"):
+                raise MeshError("only orchestration tasks can delegate subtasks", 409)
+            if parent.get("assigned_agent") and parent["assigned_agent"] != caller:
+                raise MeshError("only the assigned worker may delegate subtasks", 403)
+            existing = database.execute(
+                """
+                SELECT * FROM delegation_batches
+                WHERE parent_task_id=? AND idempotency_key=?
+                """,
+                (parent["id"], idempotency_key),
+            ).fetchone()
+            if existing is not None:
+                if str(existing["requested_by"]) != caller:
+                    raise MeshError("delegation idempotency key belongs to another agent", 403)
+                return self._subtask_tree_locked(
+                    database, parent["id"], str(existing["id"])
+                )
+            if parent.get("status") not in {"acknowledged", "running"}:
+                raise MeshError(
+                    f"task cannot delegate subtasks from state {parent['status']}", 409
+                )
+            self._validate_task_lease(
+                database, parent, caller, str(token) if token else None, required=True
+            )
+            run = self._run_row(database, str(parent["run_id"]))
+            depth = int(parent.get("delegation_depth") or 0) + 1
+            max_depth = int(run.get("max_delegation_depth") or self.settings.max_delegation_depth)
+            if depth > max_depth:
+                raise MeshError("delegation exceeds max_delegation_depth")
+            task_count = database.execute(
+                "SELECT COUNT(*) FROM tasks WHERE run_id=?", (parent["run_id"],)
+            ).fetchone()[0]
+            if int(task_count) + len(raw_tasks) > self.settings.max_run_tasks:
+                raise MeshError("run exceeds the task limit")
+            open_batches = database.execute(
+                """
+                SELECT COUNT(*) FROM delegation_batches
+                WHERE parent_task_id=? AND state='open'
+                """,
+                (parent["id"],),
+            ).fetchone()[0]
+            total_batches = database.execute(
+                "SELECT COUNT(*) FROM delegation_batches WHERE parent_task_id=?",
+                (parent["id"],),
+            ).fetchone()[0]
+            if int(open_batches) > 0:
+                raise MeshError("task already has an open delegation batch", 409)
+            if int(total_batches) >= self.settings.max_delegation_batches:
+                raise MeshError("task exceeds the delegation-batch limit")
+
+            plans: list[dict[str, Any]] = []
+            ancestry = {caller.casefold()}
+            for ancestor in self._ancestor_tasks_locked(database, int(parent["id"])):
+                if ancestor.get("assigned_agent"):
+                    ancestry.add(str(ancestor["assigned_agent"]).casefold())
+            for index, raw in enumerate(raw_tasks):
+                if not isinstance(raw, dict):
+                    raise MeshError("each delegated subtask must be an object")
+                item = dict(raw)
+                item.setdefault("task_id", item.get("task_key") or f"subtask_{index + 1}")
+                assigned_child = item.get("assigned_to") or item.get("assigned_agent")
+                if assigned_child and str(assigned_child).strip().lower() == "orchestrator":
+                    raise MeshError(
+                        "synthetic orchestrator cannot execute delegated work",
+                        409,
+                    )
+                if assigned_child and str(assigned_child).casefold() in ancestry:
+                    raise MeshError(
+                        f"delegation cannot assign a child to an ancestor agent: {assigned_child}"
+                    )
+                plans.append(item)
+            graph = self._validate_task_graph(plans)
+            batch_id = redact_text(data.get("batch_id") or str(uuid.uuid4()))
+            if database.execute(
+                "SELECT 1 FROM delegation_batches WHERE id=?", (batch_id,)
+            ).fetchone() is not None:
+                raise MeshError("delegation batch ID already exists", 409)
+            stamp = utc_now()
+            database.execute(
+                """
+                INSERT INTO delegation_batches
+                (id, run_id, parent_task_id, requested_by, delegation_depth,
+                 join_policy, state, idempotency_key, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, 'open', ?, ?, ?)
+                """,
+                (
+                    batch_id,
+                    parent["run_id"],
+                    parent["id"],
+                    caller,
+                    depth,
+                    join_policy,
+                    idempotency_key,
+                    stamp,
+                    stamp,
+                ),
+            )
+            key_to_id: dict[str, int] = {}
+            for index, plan in enumerate(plans):
+                key = str(plan["task_id"])
+                child = self._insert_task(
+                    database,
+                    title=plan.get("title") or key,
+                    owner_agent=parent.get("owner_agent") or parent.get("lead_agent") or caller,
+                    run_id=parent["run_id"],
+                    task_key=f"{batch_id}:{key}",
+                    parent_task_id=int(parent["id"]),
+                    created_by=caller,
+                    lead_agent=parent.get("lead_agent") or parent.get("owner_agent") or caller,
+                    description=plan.get("description") or plan.get("task") or "",
+                    assigned_agent=plan.get("assigned_to") or plan.get("assigned_agent"),
+                    required_capabilities=plan.get("required_capabilities") or plan.get("capabilities"),
+                    required_tools=plan.get("required_tools") or plan.get("tools"),
+                    required_skills=plan.get("required_skills") or plan.get("skills"),
+                    dependencies=[],
+                    artifact_paths=plan.get("artifact_paths") or plan.get("relevant_files"),
+                    candidate_agents=plan.get("candidate_agents"),
+                    task_type=plan.get("task_type") or "work",
+                    input_data=plan.get("input") or {},
+                    acceptance_criteria=plan.get("acceptance_criteria") or "",
+                    interfaces=plan.get("interfaces") or {},
+                    constraints=plan.get("constraints") or "",
+                    priority=plan.get("priority") or "medium",
+                    max_retries=plan.get("max_retries"),
+                    ack_timeout=plan.get("ack_timeout"),
+                    execution_timeout=plan.get("execution_timeout"),
+                    retry_backoff=plan.get("retry_backoff"),
+                    idempotency_key=f"{batch_id}:{key}",
+                    correlation_id=f"{parent.get('correlation_id') or parent.get('task_key')}:{key}",
+                    conversation_id=parent.get("conversation_id") or parent["run_id"],
+                    reassign_on_retry=bool(plan.get("reassign_on_retry", True)),
+                    delegation_depth=depth,
+                    delegation_batch_id=batch_id,
+                    project=plan.get("project") or parent.get("project"),
+                    context_path=plan.get("context_path") or parent.get("context_path"),
+                    result_path=plan.get("result_path"),
+                )
+                child_rows.append(child)
+                key_to_id[key] = int(child["id"])
+            for child, plan in zip(child_rows, plans):
+                for dependency in graph[str(plan["task_id"])]:
+                    database.execute(
+                        "INSERT INTO task_dependencies(task_id, depends_on_task_id) VALUES (?, ?)",
+                        (child["id"], key_to_id[dependency]),
+                    )
+                child["dependencies_json"] = json_text(
+                    graph[str(plan["task_id"])], []
+                )
+                database.execute(
+                    "UPDATE tasks SET dependencies_json=? WHERE id=?",
+                    (child["dependencies_json"], child["id"]),
+                )
+                self._event(
+                    database,
+                    "task.created",
+                    actor=caller,
+                    run_id=parent["run_id"],
+                    task_id=child["id"],
+                    payload={
+                        "parent_task_id": parent["id"],
+                        "delegation_batch_id": batch_id,
+                        "task_key": child["task_key"],
+                    },
+                )
+            # Keep an auditable, provider-bound record of the delegation
+            # action.  Child work still follows the normal result and verify
+            # gates before this parent can continue.
+            database.execute(
+                """
+                INSERT INTO task_results
+                (task_id, task_key, attempt, agent_id, provider, model, status,
+                 result_json, idempotency_key, execution_cycle, submitted_at)
+                VALUES (?, ?, ?, ?, ?, ?, 'delegated', ?, ?, ?, ?)
+                """,
+                (
+                    parent["id"],
+                    parent.get("task_key"),
+                    parent.get("attempt") or 0,
+                    caller,
+                    parent.get("assigned_provider") or "",
+                    parent.get("assigned_model") or "",
+                    json_text(
+                        {
+                            "action": "delegate",
+                            "summary": "delegation requested",
+                            "batch_id": batch_id,
+                            "idempotency_key": idempotency_key,
+                            "join_policy": join_policy,
+                            "subtask_count": len(child_rows),
+                        },
+                        {},
+                    ),
+                    f"delegation:{batch_id}",
+                    int(parent.get("execution_cycle") or 0),
+                    stamp,
+                ),
+            )
+            database.execute(
+                """
+                UPDATE tasks
+                SET status='waiting_subagents', delegation_state='waiting',
+                    waiting_reason=?, lease_owner=NULL, lease_expires_at=NULL,
+                    lease_token_hash=NULL, lease_token_expires_at=NULL,
+                    suspended_at=?, continuation_ready_at=NULL, updated_at=?
+                WHERE id=?
+                """,
+                (f"waiting for delegation batch {batch_id}", stamp, stamp, parent["id"]),
+            )
+            self._release_artifacts(database, int(parent["id"]))
+            self._event(
+                database,
+                "task.delegation_requested",
+                actor=caller,
+                run_id=parent["run_id"],
+                task_id=parent["id"],
+                payload={
+                    "batch_id": batch_id,
+                    "join_policy": join_policy,
+                    "child_count": len(child_rows),
+                    "delegation_depth": depth,
+                },
+            )
+            self._event(
+                database,
+                "task.waiting_subagents",
+                actor=caller,
+                run_id=parent["run_id"],
+                task_id=parent["id"],
+                payload={
+                    "batch_id": batch_id,
+                    "join_policy": join_policy,
+                    "child_count": len(child_rows),
+                },
+            )
+            parent = dict(
+                database.execute("SELECT * FROM tasks WHERE id=?", (parent["id"],)).fetchone()
+            )
+            batch = dict(
+                database.execute(
+                    "SELECT * FROM delegation_batches WHERE id=?", (batch_id,)
+                ).fetchone()
+            )
+        self.sync_task(parent)
+        for child in child_rows:
+            self.sync_task(child)
+        self.dispatch_runnable(parent.get("run_id") or None)
+        self.reconcile_run(parent.get("run_id"))
+        return self.get_subtask_tree(parent["id"], batch["id"])
+
+    def _subtask_tree_locked(
+        self,
+        database: sqlite3.Connection,
+        reference: Any,
+        batch_id: str | None = None,
+    ) -> dict[str, Any]:
+        parent = self._task_row(database, reference)
+        task_rows: list[dict[str, Any]] = []
+        frontier = [int(parent["id"])]
+        if batch_id:
+            batch_exists = database.execute(
+                "SELECT 1 FROM delegation_batches WHERE id=? AND parent_task_id=?",
+                (str(batch_id), parent["id"]),
+            ).fetchone()
+            if batch_exists is None:
+                raise MeshError("delegation batch not found", 404)
+        first_level = True
+        while frontier:
+            placeholders = ",".join("?" for _ in frontier)
+            values: list[Any] = list(frontier)
+            query = f"SELECT * FROM tasks WHERE parent_task_id IN ({placeholders})"
+            if batch_id and first_level:
+                query += " AND delegation_batch_id=?"
+                values.append(str(batch_id))
+            query += " ORDER BY id"
+            rows = [dict(row) for row in database.execute(query, values)]
+            if not rows:
+                break
+            task_rows.extend(rows)
+            frontier = [int(row["id"]) for row in rows]
+            first_level = False
+        parent_ids = [int(parent["id"])] + [int(row["id"]) for row in task_rows]
+        placeholders = ",".join("?" for _ in parent_ids)
+        batch_query = (
+            f"SELECT * FROM delegation_batches WHERE parent_task_id IN ({placeholders})"
+        )
+        batch_values: list[Any] = parent_ids
+        if batch_id:
+            batch_query += " AND id=?"
+            batch_values.append(str(batch_id))
+        batch_query += " ORDER BY created_at, id"
+        batches = [dict(row) for row in database.execute(batch_query, batch_values)]
+        return {
+            "parent": self._task_json_fields(parent),
+            "batches": [self._delegation_json(batch) for batch in batches],
+            "tasks": [self._task_json_fields(row) for row in task_rows],
+        }
+
+    def get_subtask_tree(
+        self, reference: Any, batch_id: str | None = None
+    ) -> dict[str, Any]:
+        with self.connect() as database:
+            return self._subtask_tree_locked(database, reference, batch_id)
+
+    @staticmethod
+    def _delegation_json(batch: dict[str, Any]) -> dict[str, Any]:
+        result = dict(batch)
+        result["error"] = json_value(result.get("error_json"), {})
+        return result
+
+    def cancel_subtasks(
+        self, reference: Any, batch_id: str, actor: str = "orchestrator"
+    ) -> dict[str, Any]:
+        cancel_messages: list[dict[str, Any]] = []
+        with self.transaction() as database:
+            parent = self._task_row(database, reference)
+            batch_row = database.execute(
+                "SELECT * FROM delegation_batches WHERE id=? AND parent_task_id=?",
+                (str(batch_id), parent["id"]),
+            ).fetchone()
+            if batch_row is None:
+                raise MeshError("delegation batch not found", 404)
+            batch = dict(batch_row)
+            if batch.get("state") != "open":
+                # Cancellation is idempotent for an already settled batch.
+                return self._subtask_tree_locked(
+                    database, parent["id"], str(batch["id"])
+                )
+            children = [
+                dict(row)
+                for row in database.execute(
+                    """
+                    WITH RECURSIVE descendants AS (
+                        SELECT * FROM tasks WHERE delegation_batch_id=?
+                        UNION ALL
+                        SELECT t.* FROM tasks t
+                        JOIN descendants d ON t.parent_task_id=d.id
+                    )
+                    SELECT * FROM descendants ORDER BY id
+                    """,
+                    (batch["id"],),
+                )
+            ]
+            stamp = utc_now()
+            for child in children:
+                if child["status"] in TASK_TERMINAL:
+                    continue
+                database.execute(
+                    "UPDATE tasks SET status='cancelled', waiting_reason='delegation cancelled', updated_at=?, failed_at=? WHERE id=?",
+                    (stamp, stamp, child["id"]),
+                )
+                database.execute(
+                    "UPDATE messages SET status='cancelled', completed_at=? WHERE task_id=? AND status IN ('queued','sent','delivered','acknowledged')",
+                    (stamp, child["id"]),
+                )
+                if child.get("assigned_agent"):
+                    cancel_message = self._insert_message(
+                        database,
+                        from_agent=actor,
+                        to_agent=child["assigned_agent"],
+                        task_id=child["id"],
+                        subject=f"TASK_CANCEL: {child['title']}",
+                        body=f"Cancel task {child.get('task_key') or child['id']}.",
+                        message_type="TASK_CANCEL",
+                        payload={
+                            "task_id": child.get("task_key") or child["id"],
+                            "reason": "delegation cancelled",
+                        },
+                        correlation_id=child.get("correlation_id"),
+                        conversation_id=child.get("conversation_id"),
+                        idempotency_key=f"{child.get('task_key')}:cancel",
+                    )
+                    cancel_messages.append(cancel_message)
+                self._release_artifacts(database, int(child["id"]))
+                self._event(
+                    database,
+                    "task.cancelled",
+                    actor=actor,
+                    run_id=child.get("run_id"),
+                    task_id=child["id"],
+                    payload={"delegation_batch_id": batch["id"]},
+                )
+            batch_ids = [str(batch["id"])]
+            child_ids = [int(child["id"]) for child in children]
+            if child_ids:
+                placeholders = ",".join("?" for _ in child_ids)
+                nested = database.execute(
+                    f"SELECT id FROM delegation_batches WHERE parent_task_id IN ({placeholders}) AND state='open'",
+                    child_ids,
+                ).fetchall()
+                batch_ids.extend(str(row["id"]) for row in nested)
+            batch_placeholders = ",".join("?" for _ in batch_ids)
+            database.execute(
+                f"UPDATE delegation_batches SET state='cancelled', updated_at=?, completed_at=?, error_json=? WHERE id IN ({batch_placeholders})",
+                [stamp, stamp, json_text({"message": "cancelled by " + str(actor)}, {})]
+                + batch_ids,
+            )
+            if parent["status"] == "waiting_subagents":
+                database.execute(
+                    "UPDATE tasks SET status='pending', delegation_state='resume', continuation_count=continuation_count+1, waiting_reason='delegation cancelled', updated_at=? WHERE id=?",
+                    (stamp, parent["id"]),
+                )
+                self._event(
+                    database,
+                    "task.continuation_ready",
+                    actor=actor,
+                    run_id=parent.get("run_id"),
+                    task_id=parent["id"],
+                    payload={"batch_id": batch["id"], "cancelled": True},
+                )
+        self.dispatch_runnable(parent.get("run_id") or None)
+        self.reconcile_run(parent.get("run_id"))
+        for message in cancel_messages:
+            self.sync_message(message)
+        return self.get_subtask_tree(parent["id"], batch["id"])
 
     def submit_result(self, reference: Any, data: dict[str, Any]) -> dict[str, Any]:
         result = self._validate_result(data.get("result") or data.get("payload"))
+        if result.get("action") == "delegate":
+            # Delegation is a non-blocking transition.  The parent is
+            # suspended by delegate_subtasks and will be dispatched again
+            # only after the child batch reaches its join policy.
+            return self.delegate_subtasks(
+                reference,
+                {
+                    "agent": data.get("agent") or data.get("agent_id"),
+                    "_caller_agent": data.get("_caller_agent"),
+                    "_lease_token": data.get("_lease_token"),
+                    "idempotency_key": result["idempotency_key"],
+                    "join_policy": result.get("join_policy") or "all_success",
+                    "tasks": result["subtasks"],
+                },
+            )
         with self.transaction() as database:
             task = self._task_row(database, reference)
             agent = self._validate_agent_for_task(task, data.get("agent") or data.get("agent_id"))
+            self._validate_worker_mutation_lease(database, task, agent, data)
             key = redact_text(
                 data.get("idempotency_key")
                 or f"{task.get('task_key')}:attempt:{task.get('attempt')}"
@@ -2606,8 +3661,8 @@ class MeshStore:
                 """
                 INSERT INTO task_results
                 (task_id, task_key, attempt, agent_id, provider, model, status,
-                 result_json, idempotency_key, submitted_at)
-                VALUES (?, ?, ?, ?, ?, ?, 'submitted', ?, ?, ?)
+                 result_json, idempotency_key, execution_cycle, submitted_at)
+                VALUES (?, ?, ?, ?, ?, ?, 'submitted', ?, ?, ?, ?)
                 """,
                 (
                     task["id"],
@@ -2618,6 +3673,7 @@ class MeshStore:
                     task.get("assigned_model") or "",
                     json_text(result, {}),
                     key,
+                    int(task.get("execution_cycle") or 0),
                     stamp,
                 ),
             )
@@ -2625,7 +3681,8 @@ class MeshStore:
                 """
                 UPDATE tasks SET status='verifying', result_json=?,
                     result_received_at=?, verification_status='pending',
-                    updated_at=?, lease_expires_at=NULL
+                    updated_at=?, lease_expires_at=NULL,
+                    lease_token_hash=NULL, lease_token_expires_at=NULL
                 WHERE id=?
                 """,
                 (json_text(result, {}), stamp, stamp, task["id"]),
@@ -2687,6 +3744,7 @@ class MeshStore:
         with self.transaction() as database:
             task = self._task_row(database, reference)
             agent = self._validate_agent_for_task(task, data.get("agent") or data.get("agent_id"))
+            self._validate_worker_mutation_lease(database, task, agent, data)
             self._queue_retry_locked(
                 database,
                 task,
@@ -2734,20 +3792,32 @@ class MeshStore:
                     409,
                 )
             if valid:
+                result_row = database.execute(
+                    """
+                    SELECT id FROM task_results
+                    WHERE task_id=? AND status='submitted'
+                    ORDER BY id DESC LIMIT 1
+                    """,
+                    (task["id"],),
+                ).fetchone()
+                result_ref = str(result_row["id"]) if result_row is not None else None
                 database.execute(
                     """
                     UPDATE tasks SET status='completed', verification_status='accepted',
-                        verified_at=?, updated_at=?, completed_at=?
+                        verified_at=?, updated_at=?, completed_at=?,
+                        verified_result_ref=?, lease_token_hash=NULL,
+                        lease_token_expires_at=NULL, lease_owner=NULL,
+                        lease_expires_at=NULL
                     WHERE id=?
                     """,
-                    (stamp, stamp, stamp, task["id"]),
+                    (stamp, stamp, stamp, result_ref, task["id"]),
                 )
                 database.execute(
                     """
                     UPDATE task_results SET status='verified', verified_at=?
-                    WHERE id=(SELECT id FROM task_results WHERE task_id=? ORDER BY id DESC LIMIT 1)
+                    WHERE id=?
                     """,
-                    (stamp, task["id"]),
+                    (stamp, result_row["id"] if result_row is not None else -1),
                 )
                 self._release_artifacts(database, int(task["id"]))
                 self._event(
@@ -2765,13 +3835,17 @@ class MeshStore:
                     run_id=task.get("run_id") or None,
                     task_id=task["id"],
                 )
+                if task.get("parent_task_id"):
+                    self._settle_delegation_batches_locked(
+                        database, int(task["parent_task_id"])
+                    )
             else:
                 reason = {"message": redact_text(str(revision or "verification failed"))}
                 if data.get("expected") is not None:
                     reason["expected"] = sanitize(data["expected"])
                 if data.get("actual") is not None:
                     reason["actual"] = sanitize(data["actual"])
-                if bool(data.get("retry", True)) and int(task.get("attempt") or 0) < int(task.get("max_retries") or 0) + 1:
+                if bool(data.get("retry", True)):
                     self._queue_retry_locked(
                         database,
                         task,
@@ -2783,12 +3857,18 @@ class MeshStore:
                     database.execute(
                         """
                         UPDATE tasks SET status='failed', verification_status='rejected',
-                            error_json=?, failed_at=?, updated_at=?, waiting_reason=?
+                            error_json=?, failed_at=?, updated_at=?, waiting_reason=?,
+                            lease_token_hash=NULL, lease_token_expires_at=NULL,
+                            lease_owner=NULL, lease_expires_at=NULL
                         WHERE id=?
                         """,
                         (json_text(reason, {}), stamp, stamp, reason["message"], task["id"]),
                     )
                     self._release_artifacts(database, int(task["id"]))
+                    if task.get("parent_task_id"):
+                        self._settle_delegation_batches_locked(
+                            database, int(task["parent_task_id"])
+                        )
                     self._event(
                         database,
                         "task.verification_failed",
@@ -2804,14 +3884,18 @@ class MeshStore:
         return self.decorate_task(updated)
 
     def cancel_task(self, reference: Any, actor: str = "orchestrator") -> dict[str, Any]:
+        cancel_messages: list[dict[str, Any]] = []
         cancel_message = None
         with self.transaction() as database:
             task = self._task_row(database, reference)
+            descendants = self._descendant_tasks_locked(database, int(task["id"]))
             if task["status"] not in TASK_TERMINAL:
                 database.execute(
                     """
                     UPDATE tasks SET status='cancelled', waiting_reason='cancelled',
-                        updated_at=?, failed_at=?
+                        updated_at=?, failed_at=?, lease_owner=NULL,
+                        lease_expires_at=NULL, lease_token_hash=NULL,
+                        lease_token_expires_at=NULL
                     WHERE id=?
                     """,
                     (utc_now(), utc_now(), task["id"]),
@@ -2840,6 +3924,7 @@ class MeshStore:
                         conversation_id=task.get("conversation_id"),
                         idempotency_key=f"{task.get('task_key')}:cancel",
                     )
+                    cancel_messages.append(cancel_message)
                 self._release_artifacts(database, int(task["id"]))
                 self._event(
                     database,
@@ -2849,10 +3934,67 @@ class MeshStore:
                     task_id=task["id"],
                     message_id=cancel_message["id"] if cancel_message else None,
                 )
+            all_task_ids = [int(task["id"])]
+            for descendant in descendants:
+                if descendant["status"] in TASK_TERMINAL:
+                    all_task_ids.append(int(descendant["id"]))
+                    continue
+                descendant_stamp = utc_now()
+                database.execute(
+                    """
+                    UPDATE tasks SET status='cancelled', waiting_reason='parent task cancelled',
+                        updated_at=?, failed_at=?, lease_owner=NULL,
+                        lease_expires_at=NULL, lease_token_hash=NULL,
+                        lease_token_expires_at=NULL
+                    WHERE id=?
+                    """,
+                    (descendant_stamp, descendant_stamp, descendant["id"]),
+                )
+                database.execute(
+                    """
+                    UPDATE messages SET status='cancelled', completed_at=?
+                    WHERE task_id=? AND status IN ('queued','sent','delivered','acknowledged')
+                    """,
+                    (descendant_stamp, descendant["id"]),
+                )
+                if descendant.get("assigned_agent"):
+                    descendant_cancel = self._insert_message(
+                        database,
+                        from_agent=actor,
+                        to_agent=descendant["assigned_agent"],
+                        task_id=descendant["id"],
+                        subject=f"TASK_CANCEL: {descendant['title']}",
+                        body=f"Cancel task {descendant.get('task_key') or descendant['id']}.",
+                        message_type="TASK_CANCEL",
+                        payload={
+                            "task_id": descendant.get("task_key") or descendant["id"],
+                            "reason": "parent task cancelled",
+                        },
+                        correlation_id=descendant.get("correlation_id"),
+                        conversation_id=descendant.get("conversation_id"),
+                        idempotency_key=f"{descendant.get('task_key')}:cancel",
+                    )
+                    cancel_messages.append(descendant_cancel)
+                self._release_artifacts(database, int(descendant["id"]))
+                self._event(
+                    database,
+                    "task.cancelled",
+                    actor=actor,
+                    run_id=descendant.get("run_id") or None,
+                    task_id=descendant["id"],
+                    payload={"parent_task_id": task["id"]},
+                )
+                all_task_ids.append(int(descendant["id"]))
+            if all_task_ids:
+                placeholders = ",".join("?" for _ in all_task_ids)
+                database.execute(
+                    f"UPDATE delegation_batches SET state='cancelled', updated_at=?, completed_at=? WHERE parent_task_id IN ({placeholders}) AND state='open'",
+                    [utc_now(), utc_now()] + all_task_ids,
+                )
             updated = dict(database.execute("SELECT * FROM tasks WHERE id=?", (task["id"],)).fetchone())
         self.sync_task(updated)
-        if cancel_message:
-            self.sync_message(cancel_message)
+        for message in cancel_messages:
+            self.sync_message(message)
         self.reconcile_run(task.get("run_id"))
         return self.decorate_task(updated)
 
@@ -2890,7 +4032,7 @@ class MeshStore:
         with self.transaction() as database:
             task = self._task_row(database, reference)
             database.execute(
-                "UPDATE tasks SET lease_owner=NULL, lease_expires_at=NULL, updated_at=? WHERE id=?",
+                "UPDATE tasks SET lease_owner=NULL, lease_expires_at=NULL, lease_token_hash=NULL, lease_token_expires_at=NULL, updated_at=? WHERE id=?",
                 (utc_now(), task["id"]),
             )
             updated = dict(database.execute("SELECT * FROM tasks WHERE id=?", (task["id"],)).fetchone())
@@ -2937,6 +4079,8 @@ class MeshStore:
         plans = plan.get("tasks") or []
         if not isinstance(plans, list):
             raise MeshError("tasks must be a list")
+        if len(plans) > self.settings.max_run_tasks:
+            raise MeshError("run exceeds the task limit")
         run_id = redact_text(data.get("run_id") or str(uuid.uuid4()))
         max_depth = int(data.get("max_delegation_depth", self.settings.max_delegation_depth))
         if max_depth < 0 or max_depth > self.settings.max_delegation_depth:
@@ -2991,6 +4135,12 @@ class MeshStore:
                     raise MeshError(f"task {key} exceeds max_delegation_depth")
                 if depth < 0:
                     raise MeshError(f"task {key} has an invalid delegation_depth")
+                assigned = task_plan.get("assigned_to") or task_plan.get("assigned_agent")
+                if assigned and str(assigned).strip().lower() == "orchestrator":
+                    raise MeshError(
+                        "synthetic orchestrator cannot execute delegated work",
+                        409,
+                    )
                 dependencies = graph[key]
                 row = self._insert_task(
                     database,
@@ -3035,6 +4185,10 @@ class MeshStore:
                 key = str(row["task_key"])
                 parent_ref = parent_refs.get(key)
                 if parent_ref in (None, ""):
+                    if depths[key] != 0:
+                        raise MeshError(
+                            f"root task {key} must have delegation_depth 0"
+                        )
                     continue
                 parent_text = str(parent_ref)
                 if parent_text in task_id_by_key:
@@ -3045,8 +4199,15 @@ class MeshStore:
                         )
                 elif parent_text.isdigit():
                     parent_id = int(parent_text)
-                    if database.execute("SELECT 1 FROM tasks WHERE id=?", (parent_id,)).fetchone() is None:
+                    parent_row = database.execute(
+                        "SELECT run_id FROM tasks WHERE id=?", (parent_id,)
+                    ).fetchone()
+                    if parent_row is None:
                         raise MeshError(f"parent task {parent_ref} for {key} was not found")
+                    if str(parent_row["run_id"] or "") != run_id:
+                        raise MeshError(
+                            f"parent task {parent_ref} for {key} belongs to another run"
+                        )
                 else:
                     raise MeshError(f"parent task {parent_ref} for {key} was not found")
                 if parent_id == int(row["id"]):
@@ -3115,6 +4276,8 @@ class MeshStore:
                     state = "VERIFYING"
                 elif statuses & {"sent", "acknowledged", "running"}:
                     state = "EXECUTING"
+                elif "waiting_subagents" in statuses:
+                    state = "WAITING"
                 elif statuses & {"pending", "retrying", "waiting_agent", "waiting_dependency"}:
                     state = "WAITING"
                 else:
@@ -3450,7 +4613,12 @@ class MeshStore:
             for task in tasks:
                 if task["status"] not in TASK_TERMINAL:
                     database.execute(
-                        "UPDATE tasks SET status='cancelled', waiting_reason='run cancelled', updated_at=? WHERE id=?",
+                        """
+                        UPDATE tasks SET status='cancelled', waiting_reason='run cancelled',
+                            updated_at=?, lease_owner=NULL, lease_expires_at=NULL,
+                            lease_token_hash=NULL, lease_token_expires_at=NULL
+                        WHERE id=?
+                        """,
                         (utc_now(), task["id"]),
                     )
                     database.execute(
@@ -3484,6 +4652,10 @@ class MeshStore:
                         task_id=task["id"],
                         message_id=cancel_message["id"] if task.get("assigned_agent") else None,
                     )
+            database.execute(
+                "UPDATE delegation_batches SET state='cancelled', updated_at=?, completed_at=? WHERE run_id=? AND state='open'",
+                (utc_now(), utc_now(), run_id),
+            )
             database.execute(
                 "UPDATE orchestration_runs SET state='CANCELLED', updated_at=?, completed_at=? WHERE id=?",
                 (utc_now(), utc_now(), run_id),
@@ -3549,6 +4721,7 @@ class MeshStore:
                     "orchestration_runs",
                     "orchestration_events",
                     "autonomous_requests",
+                    "delegation_batches",
                 )
             }
             queue = {
@@ -3565,7 +4738,17 @@ class MeshStore:
             "port": self.settings.port,
             "counts": counts,
             "task_queue": queue,
+            # Keep the legacy discriminator stable for existing clients while
+            # advertising the additive recursive contract explicitly.
             "protocol": "task-request-v1",
+            "protocol_v2": "task-request-v2",
+            "delegation": {
+                "max_depth": self.settings.max_delegation_depth,
+                "max_children": self.settings.max_delegation_children,
+                "max_batches_per_task": self.settings.max_delegation_batches,
+                "max_tasks_per_run": self.settings.max_run_tasks,
+                "join_policies": sorted(DELEGATION_JOIN_POLICIES),
+            },
             "orchestration_states": sorted(
                 {
                     "RECEIVED",

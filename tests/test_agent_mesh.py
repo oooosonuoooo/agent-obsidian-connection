@@ -89,18 +89,34 @@ class MeshTestCase(unittest.TestCase):
             for item in inbox
             if item["task"].get("task_key") == task_key
         )
+        lease_token = next(
+            item["lease_token"]
+            for item in inbox
+            if item["task"].get("task_key") == task_key
+        )
         self.store.acknowledge_task(
             task_key,
-            {"agent": agent, "message_id": message["id"], "accepted": True},
+            {
+                "agent": agent,
+                "message_id": message["id"],
+                "accepted": True,
+                "_lease_token": lease_token,
+            },
         )
         self.store.task_progress(
             task_key,
-            {"agent": agent, "progress": 100, "summary": "work finished"},
+            {
+                "agent": agent,
+                "progress": 100,
+                "summary": "work finished",
+                "_lease_token": lease_token,
+            },
         )
         submitted = self.store.submit_result(
             task_key,
             {
                 "agent": agent,
+                "_lease_token": lease_token,
                 "idempotency_key": f"{task_key}:result:1",
                 "result": {
                     "summary": summary,
@@ -134,6 +150,211 @@ class MeshTestCase(unittest.TestCase):
 
 
 class AgentMeshCoreTests(MeshTestCase):
+    def test_recursive_delegation_suspends_resumes_and_keeps_one_run(self) -> None:
+        self.register("LeadWorker", ["orchestration", "python"])
+        self.register("WorkerB", ["python"])
+        self.register("WorkerC", ["python"])
+        self.register("WorkerD", ["python"])
+        run = self.store.create_run(
+            {
+                "run_id": "recursive-run",
+                "request": "Coordinate nested non-coding research and verification work",
+                "lead_agent": "LeadWorker",
+                "plan": {
+                    "tasks": [
+                        {
+                            "task_id": "root",
+                            "title": "Lead task",
+                            "assigned_agent": "LeadWorker",
+                            "artifact_paths": ["notes/root.md"],
+                        }
+                    ]
+                },
+            }
+        )
+        root_inbox = self.store.poll_tasks("LeadWorker", 1)
+        root_item = root_inbox[0]
+        self.store.acknowledge_task(
+            "root", {"agent": "LeadWorker", "message_id": root_item["message"]["id"]}
+        )
+        self.store.task_progress(
+            "root", {"agent": "LeadWorker", "progress": 10, "summary": "delegating"}
+        )
+        tree = self.store.delegate_subtasks(
+            "root",
+            {
+                "agent": "LeadWorker",
+                "_caller_agent": "LeadWorker",
+                "_lease_token": root_item["lease_token"],
+                "idempotency_key": "root-batch-1",
+                "tasks": [
+                    {
+                        "task_id": "research",
+                        "title": "Research specialist",
+                        "assigned_agent": "WorkerB",
+                        "required_capabilities": ["python"],
+                    },
+                    {
+                        "task_id": "review",
+                        "title": "Independent review",
+                        "assigned_agent": "WorkerC",
+                        "required_capabilities": ["python"],
+                    },
+                ],
+            },
+        )
+        review_key = next(
+            item["task_key"] for item in tree["tasks"] if item["assigned_agent"] == "WorkerC"
+        )
+        self.assertEqual(tree["parent"]["status"], "waiting_subagents")
+        self.assertEqual({item["parent_task_id"] for item in tree["tasks"]}, {tree["parent"]["id"]})
+        self.assertEqual({item["delegation_depth"] for item in tree["tasks"]}, {1})
+        self.assertFalse(
+            any(item["task_key"] == "root" for item in tree["tasks"])
+        )
+
+        research_item = self.store.poll_tasks("WorkerB", 1)[0]
+        research_key = research_item["task"]["task_key"]
+        self.store.acknowledge_task(
+            research_key,
+            {"agent": "WorkerB", "message_id": research_item["message"]["id"]},
+        )
+        self.store.task_progress(
+            research_key, {"agent": "WorkerB", "progress": 10, "summary": "delegating deeper"}
+        )
+        nested = self.store.delegate_subtasks(
+            research_key,
+            {
+                "agent": "WorkerB",
+                "_caller_agent": "WorkerB",
+                "_lease_token": research_item["lease_token"],
+                "idempotency_key": "research-batch-1",
+                "tasks": [
+                    {
+                        "task_id": "verification",
+                        "title": "Verify research evidence",
+                        "assigned_agent": "WorkerD",
+                    }
+                ],
+            },
+        )
+        self.assertEqual(nested["tasks"][0]["delegation_depth"], 2)
+        self.assertEqual(nested["tasks"][0]["run_id"], "recursive-run")
+        with self.assertRaises(MeshError):
+            self.store.delegate_subtasks(
+                research_key,
+                {
+                    "agent": "WorkerB",
+                    "_caller_agent": "WorkerB",
+                    "_lease_token": "wrong-token",
+                    "idempotency_key": "research-batch-wrong",
+                    "tasks": [{"task_id": "bad", "assigned_agent": "WorkerD"}],
+                },
+            )
+
+        self.finish_task(nested["tasks"][0]["task_key"], "WorkerD", "verified evidence")
+        self.finish_task(research_key, "WorkerB", "research completed")
+        self.finish_task(review_key, "WorkerC", "review completed")
+        self.assertEqual(self.store.get_task("root")["status"], "sent")
+        self.assertEqual(self.store.get_task("root")["assigned_agent"], "LeadWorker")
+        root_continuation = self.store.poll_tasks("LeadWorker", 1)
+        self.assertEqual(len(root_continuation), 1)
+        self.store.acknowledge_task(
+            "root",
+            {"agent": "LeadWorker", "message_id": root_continuation[0]["message"]["id"]},
+        )
+        self.store.submit_result(
+            "root", {"agent": "LeadWorker", "result": {"summary": "lead integrated verified child evidence"}}
+        )
+        self.store.verify_task("root", {"verified_by": "LeadWorker", "valid": True})
+        final_run = self.store.get_run("recursive-run")
+        self.assertEqual(final_run["state"], "COMPLETED")
+        full_tree = self.store.get_subtask_tree("root")
+        self.assertEqual(len(full_tree["tasks"]), 3)
+        self.assertEqual(len(full_tree["batches"]), 2)
+        self.assertTrue(
+            {
+                "task.delegation_requested",
+                "task.waiting_subagents",
+                "delegation.completed",
+                "task.continuation_ready",
+            }
+            <= {event["event_type"] for event in final_run["events"]}
+        )
+
+    def test_all_settled_join_resumes_after_failed_child_and_limits_depth(self) -> None:
+        self.register("Lead", ["orchestration"])
+        self.register("Worker", ["python"])
+        run = self.store.create_run(
+            {
+                "run_id": "settled-run",
+                "request": "Allow a research fallback after a failed child",
+                "lead_agent": "Lead",
+                "max_delegation_depth": 1,
+                "plan": {
+                    "tasks": [
+                        {
+                            "task_id": "parent",
+                            "assigned_agent": "Lead",
+                            "max_retries": 0,
+                        }
+                    ]
+                },
+            }
+        )
+        item = self.store.poll_tasks("Lead", 1)[0]
+        self.store.acknowledge_task(
+            "parent", {"agent": "Lead", "message_id": item["message"]["id"]}
+        )
+        self.store.delegate_subtasks(
+            "parent",
+            {
+                "agent": "Lead",
+                "_lease_token": item["lease_token"],
+                "idempotency_key": "settled-batch",
+                "join_policy": "all_settled",
+                "tasks": [{"task_id": "failed-child", "assigned_agent": "Worker", "max_retries": 0}],
+            },
+        )
+        failed_item = self.store.poll_tasks("Worker", 1)[0]
+        self.store.fail_task(
+            failed_item["task"]["task_key"],
+            {"agent": "Worker", "error": {"message": "simulated failure"}},
+        )
+        parent = self.store.get_task("parent")
+        self.assertEqual(parent["status"], "sent")
+        self.assertEqual(self.store.get_subtask_tree("parent")["batches"][0]["state"], "completed")
+
+        item = self.store.poll_tasks("Lead", 1)[0]
+        self.store.acknowledge_task(
+            "parent", {"agent": "Lead", "message_id": item["message"]["id"]}
+        )
+        self.store.delegate_subtasks(
+            "parent",
+            {
+                "agent": "Lead",
+                "_lease_token": item["lease_token"],
+                "idempotency_key": "level-one-again",
+                "tasks": [{"task_id": "nested-parent", "assigned_agent": "Worker"}],
+            },
+        )
+        nested_item = self.store.poll_tasks("Worker", 1)[0]
+        nested_key = nested_item["task"]["task_key"]
+        self.store.acknowledge_task(
+            nested_key,
+            {"agent": "Worker", "message_id": nested_item["message"]["id"]},
+        )
+        with self.assertRaises(MeshError):
+            self.store.delegate_subtasks(
+                nested_key,
+                {
+                    "agent": "Worker",
+                    "_lease_token": nested_item["lease_token"],
+                    "idempotency_key": "too-deep",
+                    "tasks": [{"task_id": "too-deep-child", "assigned_agent": "Lead"}],
+                },
+            )
+
     def test_shared_tool_and_skill_requirements_route_to_the_publishing_agent(self) -> None:
         self.register(
             "ToolOwner",
@@ -661,10 +882,20 @@ class MigrationTests(unittest.TestCase):
 
 
 class HTTPAndMCPTests(MeshTestCase):
-    def http_request(self, base_url: str, method: str, path: str, payload=None, token: str | None = "unit-test-token"):
+    def http_request(
+        self,
+        base_url: str,
+        method: str,
+        path: str,
+        payload=None,
+        token: str | None = "unit-test-token",
+        extra_headers: dict[str, str] | None = None,
+        return_headers: bool = False,
+    ):
         headers = {"Accept": "application/json"}
         if token is not None:
             headers["Authorization"] = f"Bearer {token}"
+        headers.update(extra_headers or {})
         body = None
         if payload is not None:
             body = json.dumps(payload).encode()
@@ -672,11 +903,18 @@ class HTTPAndMCPTests(MeshTestCase):
         request = Request(base_url + path, data=body, headers=headers, method=method)
         try:
             with urlopen(request, timeout=5) as response:
-                return response.status, json.loads(response.read().decode())
+                value = json.loads(response.read().decode())
+                if return_headers:
+                    return response.status, value, dict(response.headers.items())
+                return response.status, value
         except HTTPError as exc:
             raw = exc.read()
+            response_headers = dict(exc.headers.items())
             exc.close()
-            return exc.code, json.loads(raw.decode())
+            value = json.loads(raw.decode())
+            if return_headers:
+                return exc.code, value, response_headers
+            return exc.code, value
 
     def test_http_auth_routes_and_three_agent_e2e(self) -> None:
         server, base_url = self.start_http()
@@ -830,6 +1068,118 @@ class HTTPAndMCPTests(MeshTestCase):
         self.assertNotIn("?", safe_server["endpoint"])
         self.assertTrue(safe_server["auth_configured"])
         self.assertTrue(any(item["name"] == "ToolPublisher" for item in catalog["agents"]))
+
+    def test_recursive_delegation_rest_binds_worker_lease_and_cancels_tree(self) -> None:
+        _, base_url = self.start_http()
+        for name, capabilities in (("Parent", ["orchestration"]), ("Child", ["research"])):
+            status, _ = self.http_request(
+                base_url,
+                "POST",
+                "/agents/register",
+                {"name": name, "provider": "rest-test", "capabilities": capabilities},
+            )
+            self.assertEqual(status, 200)
+        status, run = self.http_request(
+            base_url,
+            "POST",
+            "/orchestration/runs",
+            {
+                "run_id": "rest-recursive",
+                "request": "Exercise REST recursive delegation",
+                "lead_agent": "Parent",
+                "plan": {
+                    "tasks": [
+                        {"task_id": "parent-task", "assigned_agent": "Parent"}
+                    ]
+                },
+            },
+        )
+        self.assertEqual(status, 201)
+        status, inbox, headers = self.http_request(
+            base_url,
+            "POST",
+            "/tasks/poll",
+            {"agent": "Parent", "limit": 1},
+            return_headers=True,
+        )
+        self.assertEqual(status, 200)
+        lease = headers.get("X-Agent-Mesh-Task-Lease")
+        self.assertTrue(lease)
+        message_id = inbox[0]["message"]["id"]
+        transport = {
+            "X-Agent-Mesh-Agent": "Parent",
+            "X-Agent-Mesh-Task-Lease": lease,
+        }
+        status, _ = self.http_request(
+            base_url,
+            "POST",
+            "/tasks/parent-task/ack",
+            {"agent": "Parent", "message_id": message_id},
+            extra_headers={
+                "X-Agent-Mesh-Agent": "Parent",
+                "X-Agent-Mesh-Task-Lease": "wrong-token",
+            },
+        )
+        self.assertEqual(status, 403)
+        status, acknowledged = self.http_request(
+            base_url,
+            "POST",
+            "/tasks/parent-task/ack",
+            {"agent": "Parent", "message_id": message_id},
+            extra_headers=transport,
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(acknowledged["status"], "acknowledged")
+        status, delegated = self.http_request(
+            base_url,
+            "POST",
+            "/tasks/parent-task/delegations",
+            {
+                "idempotency_key": "rest-batch-1",
+                "tasks": [
+                    {
+                        "task_id": "child-task",
+                        "title": "Child task",
+                        "assigned_agent": "Child",
+                        "required_capabilities": ["research"],
+                    }
+                ],
+            },
+            extra_headers=transport,
+        )
+        self.assertEqual(status, 202)
+        self.assertEqual(delegated["parent"]["status"], "waiting_subagents")
+        batch_id = delegated["batches"][0]["id"]
+        self.assertEqual(len(delegated["tasks"]), 1)
+        status, duplicate = self.http_request(
+            base_url,
+            "POST",
+            "/tasks/parent-task/delegations",
+            {
+                "idempotency_key": "rest-batch-1",
+                "tasks": [{"task_id": "ignored", "assigned_agent": "Child"}],
+            },
+            extra_headers={"X-Agent-Mesh-Agent": "Parent"},
+        )
+        self.assertEqual(status, 202)
+        self.assertEqual(duplicate["batches"][0]["id"], batch_id)
+        status, tree = self.http_request(
+            base_url, "GET", "/tasks/parent-task/subtask-tree?batch_id=" + batch_id
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(
+            [item["task_key"] for item in tree["tasks"]],
+            [delegated["tasks"][0]["task_key"]],
+        )
+        status, cancelled = self.http_request(
+            base_url,
+            "POST",
+            f"/tasks/parent-task/delegations/{batch_id}/cancel",
+            {"actor": "Parent"},
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(cancelled["batches"][0]["state"], "cancelled")
+        self.assertEqual(cancelled["tasks"][0]["status"], "cancelled")
 
     def test_canonical_registries_bootstrap_shared_catalog(self) -> None:
         root = self.base / "AI-Second-Brain"
@@ -1086,6 +1436,10 @@ class HTTPAndMCPTests(MeshTestCase):
         self.assertIn("agent_mesh_list_shared_capabilities", tool_names)
         self.assertIn("agent_mesh_list_shared_tools", tool_names)
         self.assertIn("agent_mesh_list_shared_skills", tool_names)
+        self.assertIn("agent_mesh_delegate_subtasks", tool_names)
+        self.assertIn("agent_mesh_get_subtask_tree", tool_names)
+        self.assertIn("agent_mesh_wait_subtasks", tool_names)
+        self.assertIn("agent_mesh_cancel_subtasks", tool_names)
         send({"jsonrpc": "2.0", "id": 3, "method": "shutdown", "params": {}})
         process.wait(timeout=2)
 

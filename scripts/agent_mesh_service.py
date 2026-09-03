@@ -148,13 +148,34 @@ class MeshRequestHandler(BaseHTTPRequestHandler):
         return self.server.store
 
     def respond(self, value, status: int = 200) -> None:
-        raw = json.dumps(sanitize(value), sort_keys=True).encode("utf-8")
-        self.send_response(status)
-        self.send_header("Content-Type", "application/json; charset=utf-8")
-        self.send_header("Cache-Control", "no-store")
-        self.send_header("Content-Length", str(len(raw)))
-        self.end_headers()
-        self.wfile.write(raw)
+        lease_tokens: list[str] = []
+
+        def strip_lease(item):
+            if isinstance(item, dict):
+                copied = {key: strip_lease(child) for key, child in item.items()}
+                token = copied.pop("lease_token", None) or copied.pop("_lease_token", None)
+                if token:
+                    lease_tokens.append(str(token))
+                return copied
+            if isinstance(item, list):
+                return [strip_lease(child) for child in item]
+            return item
+
+        raw = json.dumps(sanitize(strip_lease(value)), sort_keys=True).encode("utf-8")
+        try:
+            self.send_response(status)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("Content-Length", str(len(raw)))
+            if lease_tokens:
+                self.send_header("X-Agent-Mesh-Task-Lease", lease_tokens[0])
+            self.end_headers()
+            self.wfile.write(raw)
+        except (BrokenPipeError, ConnectionResetError):
+            # Polling clients may disconnect after the durable state has been
+            # committed.  That is not a service failure and must not pollute
+            # the runtime log or trigger a misleading 500 response.
+            return
 
     def error(self, detail: str, status: int = 400) -> None:
         self.respond({"error": redact_text(detail)}, status)
@@ -187,6 +208,12 @@ class MeshRequestHandler(BaseHTTPRequestHandler):
             raise MeshError("request body must be valid JSON") from exc
         if not isinstance(value, dict):
             raise MeshError("request body must be a JSON object")
+        caller = self.headers.get("X-Agent-Mesh-Agent", "").strip()
+        lease = self.headers.get("X-Agent-Mesh-Task-Lease", "").strip()
+        if caller:
+            value.setdefault("_caller_agent", caller)
+        if lease:
+            value.setdefault("_lease_token", lease)
         return value
 
     @staticmethod
@@ -224,6 +251,8 @@ class MeshRequestHandler(BaseHTTPRequestHandler):
                         "provider": agent.get("provider"),
                         "model": agent.get("model"),
                         "health": agent.get("health"),
+                        "presence_status": agent.get("presence_status"),
+                        "execution_status": agent.get("execution_status"),
                         "autonomy_ready": agent.get("autonomy_ready", False),
                     }
                 )
@@ -255,6 +284,12 @@ class MeshRequestHandler(BaseHTTPRequestHandler):
                 return self.respond(self.store.list_tasks((query.get("run_id") or [None])[0]))
             if path == "/tasks/stalled":
                 return self.respond(self._stalled_tasks())
+            if len(parts) == 3 and parts[0] == "tasks" and parts[2] == "subtask-tree":
+                return self.respond(
+                    self.store.get_subtask_tree(
+                        parts[1], (query.get("batch_id") or [None])[0]
+                    )
+                )
             if len(parts) == 2 and parts[0] == "tasks":
                 return self.respond(self.store.get_task(parts[1]))
 
@@ -302,7 +337,7 @@ class MeshRequestHandler(BaseHTTPRequestHandler):
                             "agent_mesh_mcp_stdio.py",
                             "obsidian_vault_mcp_stdio.py",
                         ],
-                        "protocol": "task-request-v1",
+                        "protocol": "task-request-v2",
                     }
                 )
             return self.error("not found", 404)
@@ -379,6 +414,22 @@ class MeshRequestHandler(BaseHTTPRequestHandler):
                 )
             if path == "/tasks":
                 return self.respond(self.store.create_legacy_task(data), 201)
+
+            if len(parts) == 3 and parts[0] == "tasks" and parts[2] == "delegations":
+                return self.respond(
+                    self.store.delegate_subtasks(parts[1], data), 202
+                )
+            if (
+                len(parts) == 5
+                and parts[0] == "tasks"
+                and parts[2] == "delegations"
+                and parts[4] == "cancel"
+            ):
+                return self.respond(
+                    self.store.cancel_subtasks(
+                        parts[1], parts[3], data.get("actor") or data.get("agent") or "orchestrator"
+                    )
+                )
 
             if len(parts) >= 3 and parts[0] == "tasks":
                 reference = parts[1]
@@ -489,6 +540,8 @@ class MeshRequestHandler(BaseHTTPRequestHandler):
                 "model": agent.get("model"),
                 "status": agent.get("status"),
                 "health": agent.get("health"),
+                "presence_status": agent.get("presence_status"),
+                "execution_status": agent.get("execution_status"),
                 "capabilities": agent.get("capabilities", {}),
                 "active_task_count": agent.get("active_task_count", 0),
                 "max_concurrent_tasks": agent.get("max_concurrent_tasks", 1),

@@ -55,6 +55,8 @@ class AdapterSpec:
             return bool(self.endpoint)
         if self.kind == "mcp":
             return bool(self.command) and bool(shutil.which(self.command[0]) or Path(self.command[0]).is_file()) and bool(self.tool)
+        if self.kind == "ollama":
+            return bool(self.endpoint and self.model)
         return False
 
 
@@ -153,6 +155,14 @@ DEFAULT_PROFILE_CAPABILITIES: dict[str, tuple[str, ...]] = {
         "task_execution",
         "orchestration",
     ),
+    "LocalLLM": (
+        "analysis",
+        "coding",
+        "testing",
+        "local_private",
+        "task_execution",
+        "orchestration",
+    ),
 }
 
 BUILTIN_AGENT_PROFILES: tuple[tuple[str, str, str], ...] = (
@@ -162,7 +172,9 @@ BUILTIN_AGENT_PROFILES: tuple[tuple[str, str, str], ...] = (
     ("Kilo", "Kilo Code", "worker"),
     ("Claude-FCC", "Anthropic", "worker"),
     ("Friday", "Local", "worker"),
+    ("Friday-Fast", "Local", "worker"),
     ("Friday-Pro", "Local", "worker"),
+    ("LocalLLM", "Ollama", "worker"),
 )
 
 
@@ -246,7 +258,99 @@ class AdapterRegistry:
             if spec is not None:
                 specs[spec.agent] = spec
         self._specs = specs
+        self._sync_existing_builtin_states(specs)
         return dict(specs)
+
+    def _sync_existing_builtin_states(self, specs: dict[str, AdapterSpec]) -> None:
+        """Keep persisted readiness aligned with real adapter discovery."""
+        builtin_names = {name for name, _, _ in BUILTIN_AGENT_PROFILES}
+        agents = {
+            str(agent.get("name")): agent for agent in self.store.list_agents()
+        }
+        for name in builtin_names:
+            spec = specs.get(name)
+            agent = agents.get(name)
+            if spec is None or agent is None:
+                continue
+            metadata = agent.get("metadata")
+            if not isinstance(metadata, dict):
+                metadata = json_value(agent.get("metadata_json"), {})
+            if not isinstance(metadata, dict):
+                metadata = {}
+            autonomy = metadata.get("autonomy")
+            if not isinstance(autonomy, dict):
+                autonomy = {}
+            current_capabilities = agent.get("capabilities")
+            if not isinstance(current_capabilities, dict):
+                current_capabilities = json_value(agent.get("capabilities_json"), {})
+            if not isinstance(current_capabilities, dict):
+                current_capabilities = {}
+            needs_update = (
+                autonomy.get("available") is not bool(spec.available)
+                or str(autonomy.get("adapter_kind") or "") != spec.kind
+                or str(autonomy.get("adapter_source") or "") != spec.source
+                or any(capability not in current_capabilities for capability in spec.capabilities)
+                or (spec.available and current_capabilities.get("autonomous_worker") is not True)
+                or str(agent.get("endpoint") or "") != str(spec.endpoint or "")
+                or str(agent.get("model") or "") != str(spec.model or "")
+            )
+            if needs_update:
+                self.store.update_agent_adapter_state(
+                    name,
+                    available=spec.available,
+                    adapter_kind=spec.kind,
+                    adapter_source=spec.source,
+                    capabilities=spec.capabilities,
+                    endpoint=spec.endpoint,
+                    model=spec.model,
+                )
+
+    def ensure_missing_builtin_registrations(self) -> None:
+        """Add a newly installed builtin without rewriting existing rows."""
+        if not self._specs:
+            self.refresh()
+        known = {str(agent["name"]) for agent in self.store.list_agents()}
+        added = False
+        for name, provider, agent_type in BUILTIN_AGENT_PROFILES:
+            if name in known:
+                continue
+            spec = self._builtin(
+                name,
+                provider,
+                {
+                    "name": name,
+                    "provider": provider,
+                    "type": agent_type,
+                    "capabilities": {
+                        capability: True
+                        for capability in DEFAULT_PROFILE_CAPABILITIES.get(name, ())
+                    },
+                },
+            )
+            if not spec.available:
+                continue
+            self.store.register_agent(
+                {
+                    "name": name,
+                    "provider": provider,
+                    "type": agent_type,
+                    "capabilities": {capability: True for capability in spec.capabilities},
+                    "status": "active",
+                    "health": "online",
+                    "metadata": {
+                        "autonomy": {
+                            "adapter_kind": spec.kind,
+                            "adapter_source": spec.source,
+                            "available": True,
+                        }
+                    },
+                    "max_concurrent_tasks": spec.max_concurrent_tasks,
+                }
+            )
+            known.add(name)
+            added = True
+        if added:
+            self.refresh()
 
     def get(self, agent: str) -> AdapterSpec | None:
         if agent not in self._specs:
@@ -280,6 +384,45 @@ class AdapterRegistry:
             }
             for spec in sorted(self._specs.values(), key=lambda item: item.agent)
         ]
+
+    def preflight(self, spec: AdapterSpec) -> tuple[bool, str]:
+        """Validate the selected invocation path immediately before dispatch."""
+        if spec.kind == "command":
+            if spec.command and (
+                shutil.which(spec.command[0]) or Path(spec.command[0]).is_file()
+            ):
+                return True, "command is executable"
+            return False, "configured command is unavailable"
+        if spec.kind == "mcp":
+            if not spec.command or not spec.tool:
+                return False, "MCP adapter command/tool is incomplete"
+            if not (shutil.which(spec.command[0]) or Path(spec.command[0]).is_file()):
+                return False, "MCP adapter command is unavailable"
+            return True, "MCP command is executable"
+        if spec.kind == "ollama":
+            return (
+                (True, "Ollama model is installed")
+                if _ollama_model_available(spec.endpoint, spec.model)
+                else (False, "Ollama model is unavailable")
+            )
+        if spec.kind == "http":
+            try:
+                parsed = urllib.parse.urlsplit(spec.endpoint)
+                if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+                    return False, "HTTP adapter endpoint is invalid"
+                request = urllib.request.Request(spec.endpoint, method="HEAD")
+                with urllib.request.urlopen(request, timeout=3.0):
+                    return True, "HTTP endpoint responded"
+            except urllib.error.HTTPError as exc:
+                # Auth-required and method-not-allowed responses prove that
+                # the endpoint is reachable; invocation will still carry the
+                # configured auth reference and handle the real response.
+                if exc.code in {400, 401, 403, 405, 501}:
+                    return True, "HTTP endpoint is reachable"
+                return False, f"HTTP endpoint returned {exc.code}"
+            except (OSError, urllib.error.URLError, ValueError) as exc:
+                return False, "HTTP endpoint preflight failed: " + redact_text(str(exc))
+        return False, "adapter is cooperative"
 
     def ensure_builtin_registrations(self) -> None:
         """Make known local CLI workers selectable while preserving user data."""
@@ -366,6 +509,33 @@ class AdapterRegistry:
                     "metadata": metadata,
                 }
             )
+        # Kiro is a configured cooperative client but has no verified local
+        # CLI adapter.  Register it once so routing and discovery can queue it
+        # truthfully until its real MCP heartbeat arrives.
+        if "Kiro" not in known:
+            self.store.register_agent(
+                {
+                    "name": "Kiro",
+                    "provider": "Kiro",
+                    "type": "cooperative",
+                    "capabilities": {
+                        "mcp": True,
+                        "orchestration": True,
+                        "task_execution": True,
+                    },
+                    "limitations": "cooperative GUI client; requires a live MCP heartbeat",
+                    "status": "offline",
+                    "health": "offline",
+                    "metadata": {
+                        "autonomy": {
+                            "adapter_kind": "cooperative",
+                            "adapter_source": "registered-config",
+                            "available": False,
+                        }
+                    },
+                }
+            )
+            known.add("Kiro")
         self.refresh()
 
     def _resolve(self, agent: dict[str, Any]) -> AdapterSpec | None:
@@ -405,7 +575,7 @@ class AdapterRegistry:
             if kind == "mcp" and not tool:
                 return AdapterSpec(**common, command=command + args, reason="registered MCP adapter has no tool")
             return AdapterSpec(**common, command=command + args, tool=tool)
-        if kind == "http":
+        if kind in {"http", "ollama"}:
             return AdapterSpec(
                 **common,
                 endpoint=str(config.get("endpoint") or agent.get("endpoint") or ""),
@@ -424,6 +594,32 @@ class AdapterRegistry:
             "source": "builtin",
             "capabilities": tuple(sorted(set(capabilities) | set(_capability_names(agent)))),
         }
+        if name == "LocalLLM":
+            model = str(
+                agent.get("model")
+                or os.environ.get("LOCAL_LLM_MODEL")
+                or "qwen2.5-coder:7b-instruct-q4_K_M"
+            )
+            endpoint = str(
+                agent.get("endpoint")
+                or os.environ.get("LOCAL_LLM_OLLAMA_ENDPOINT")
+                or "http://127.0.0.1:11434/api/chat"
+            )
+            if _ollama_model_available(endpoint, model):
+                return AdapterSpec(
+                    **common,
+                    kind="ollama",
+                    endpoint=endpoint,
+                    model=model,
+                    reason="Ollama local coder",
+                )
+            return AdapterSpec(
+                **common,
+                kind="cooperative",
+                model=model,
+                endpoint=endpoint,
+                reason=f"Ollama model {model} is unavailable",
+            )
         if name == "Gemini":
             executable = _executable("gemini")
             if executable:
@@ -439,6 +635,7 @@ class AdapterRegistry:
                         "json",
                         "--approval-mode",
                         approval,
+                        "--skip-trust",
                     ),
                     model=str(agent.get("model") or ""),
                 )
@@ -457,6 +654,7 @@ class AdapterRegistry:
                         "--json",
                         "--ephemeral",
                         "--approve-for-me",
+                        "--skip-git-repo-check",
                         "--cd",
                         "{workspace}",
                         "{prompt}",
@@ -555,6 +753,8 @@ class AdapterRegistry:
         workspace: Path,
         heartbeat: Callable[[], None] | None = None,
         cancel_check: Callable[[], bool] | None = None,
+        task_token: str = "",
+        caller_agent: str = "",
     ) -> AdapterResult:
         if not spec.available:
             return AdapterResult(
@@ -564,10 +764,24 @@ class AdapterRegistry:
                 stderr=spec.reason or "adapter unavailable",
             )
         if spec.kind == "http":
-            return self._invoke_http(spec, prompt, payload, workspace)
+            return self._invoke_http(
+                spec, prompt, payload, workspace, task_token=task_token,
+                caller_agent=caller_agent,
+            )
+        if spec.kind == "ollama":
+            return self._invoke_ollama(
+                spec, prompt, payload, workspace, task_token=task_token,
+                caller_agent=caller_agent,
+            )
         if spec.kind == "mcp":
-            return self._invoke_mcp(spec, prompt, payload, workspace)
-        return self._invoke_command(spec, prompt, workspace, heartbeat, cancel_check)
+            return self._invoke_mcp(
+                spec, prompt, payload, workspace, task_token=task_token,
+                caller_agent=caller_agent,
+            )
+        return self._invoke_command(
+            spec, prompt, workspace, heartbeat, cancel_check,
+            task_token=task_token, caller_agent=caller_agent,
+        )
 
     def _invoke_command(
         self,
@@ -576,11 +790,17 @@ class AdapterRegistry:
         workspace: Path,
         heartbeat: Callable[[], None] | None,
         cancel_check: Callable[[], bool] | None,
+        *,
+        task_token: str = "",
+        caller_agent: str = "",
     ) -> AdapterResult:
         argv = _render_argv(spec.command, prompt=prompt, workspace=workspace, agent=spec.agent, model=spec.model)
         started = time.monotonic()
         environment = os.environ.copy()
         environment["AGENT_MESH_AUTONOMOUS_AGENT"] = spec.agent
+        environment["AGENT_MESH_AGENT_NAME"] = caller_agent or spec.agent
+        if task_token:
+            environment["AGENT_MESH_TASK_TOKEN"] = task_token
         try:
             process = subprocess.Popen(
                 argv,
@@ -657,6 +877,9 @@ class AdapterRegistry:
         prompt: str,
         payload: dict[str, Any],
         workspace: Path,
+        *,
+        task_token: str = "",
+        caller_agent: str = "",
     ) -> AdapterResult:
         started = time.monotonic()
         body = json.dumps(
@@ -671,6 +894,10 @@ class AdapterRegistry:
             separators=(",", ":"),
         ).encode()
         headers = {"Accept": "application/json", "Content-Type": "application/json"}
+        if caller_agent:
+            headers["X-Agent-Mesh-Agent"] = caller_agent
+        if task_token:
+            headers["X-Agent-Mesh-Task-Lease"] = task_token
         if spec.auth_env and os.environ.get(spec.auth_env):
             headers["Authorization"] = "Bearer " + os.environ[spec.auth_env]
         request = urllib.request.Request(spec.endpoint, data=body, headers=headers, method="POST")
@@ -700,11 +927,16 @@ class AdapterRegistry:
         prompt: str,
         payload: dict[str, Any],
         workspace: Path,
+        *,
+        task_token: str = "",
+        caller_agent: str = "",
     ) -> AdapterResult:
         started = time.monotonic()
         arguments = dict(payload)
         arguments["prompt"] = prompt
         arguments["workspace"] = str(workspace)
+        if caller_agent:
+            arguments["_caller_agent"] = caller_agent
         requests = [
             {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": "2024-11-05"}},
             {
@@ -717,10 +949,18 @@ class AdapterRegistry:
         ]
         wire = b"".join(_frame(item) for item in requests)
         try:
+            environment = os.environ.copy()
+            if caller_agent:
+                environment["AGENT_MESH_AGENT_NAME"] = caller_agent
+            if task_token:
+                # Scoped lease material travels through the process
+                # environment, never through the provider prompt or MCP
+                # arguments/logs.
+                environment["AGENT_MESH_TASK_TOKEN"] = task_token
             process = subprocess.Popen(
                 list(spec.command),
                 cwd=str(workspace),
-                env=os.environ.copy(),
+                env=environment,
                 stdin=subprocess.PIPE,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
@@ -754,12 +994,99 @@ class AdapterRegistry:
                 duration_seconds=time.monotonic() - started,
             )
 
+    def _invoke_ollama(
+        self,
+        spec: AdapterSpec,
+        prompt: str,
+        payload: dict[str, Any],
+        workspace: Path,
+        *,
+        task_token: str = "",
+        caller_agent: str = "",
+    ) -> AdapterResult:
+        started = time.monotonic()
+        body = json.dumps(
+            {
+                "model": spec.model,
+                "stream": False,
+                "messages": [
+                    {
+                        "role": "system",
+                        "content": (
+                            "You are a worker in a durable agent mesh. Return only the "
+                            "requested JSON result; do not claim actions you did not perform."
+                        ),
+                    },
+                    {"role": "user", "content": prompt},
+                ],
+                "options": {"temperature": 0.1},
+            },
+            separators=(",", ":"),
+        ).encode()
+        headers = {"Accept": "application/json", "Content-Type": "application/json"}
+        if caller_agent:
+            headers["X-Agent-Mesh-Agent"] = caller_agent
+        if task_token:
+            headers["X-Agent-Mesh-Task-Lease"] = task_token
+        request = urllib.request.Request(spec.endpoint, data=body, headers=headers, method="POST")
+        try:
+            with urllib.request.urlopen(request, timeout=spec.timeout) as response:
+                document = json.loads(response.read(MAX_PROVIDER_OUTPUT + 1).decode(errors="replace"))
+            content = ""
+            if isinstance(document, dict):
+                message = document.get("message")
+                if isinstance(message, dict):
+                    content = str(message.get("content") or "")
+                if not content:
+                    content = str(document.get("response") or document.get("output") or "")
+            if not content:
+                content = json.dumps(document, separators=(",", ":"))
+            return AdapterResult(
+                agent=spec.agent,
+                kind=spec.kind,
+                stdout=_bounded(content),
+                duration_seconds=time.monotonic() - started,
+            )
+        except (OSError, urllib.error.URLError, urllib.error.HTTPError, ValueError) as exc:
+            return AdapterResult(
+                agent=spec.agent,
+                kind=spec.kind,
+                stderr=redact_text(str(exc)),
+                returncode=1,
+                duration_seconds=time.monotonic() - started,
+            )
+
 
 def _positive_number(value: Any, default: float) -> float:
     try:
         return max(float(value), 0.1)
     except (TypeError, ValueError):
         return default
+
+
+def _ollama_model_available(endpoint: str, model: str) -> bool:
+    """Probe Ollama's local tag catalog without exposing credentials."""
+    if not endpoint or not model:
+        return False
+    try:
+        parsed = urllib.parse.urlsplit(endpoint)
+        if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+            return False
+        tags_url = urllib.parse.urlunsplit(
+            (parsed.scheme, parsed.netloc, "/api/tags", "", "")
+        )
+        with urllib.request.urlopen(tags_url, timeout=2.0) as response:
+            document = json.loads(response.read(512 * 1024).decode(errors="replace"))
+        names = {
+            str(item.get("name") or item.get("model") or "")
+            for item in (document.get("models") or [])
+            if isinstance(item, dict)
+        }
+        return model in names or any(
+            name.split(":", 1)[0] == model.split(":", 1)[0] for name in names
+        )
+    except (OSError, urllib.error.URLError, urllib.error.HTTPError, ValueError):
+        return False
 
 
 def _positive_int(value: Any, default: int) -> int:
