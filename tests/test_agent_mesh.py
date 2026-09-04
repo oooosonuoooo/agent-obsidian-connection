@@ -24,6 +24,7 @@ sys.path.insert(0, str(SCRIPTS))
 
 from agent_mesh_core import MeshError, MeshStore, Settings, redact_text  # noqa: E402
 from agent_mesh_autonomy import AutonomyManager  # noqa: E402
+from agent_mesh_adapters import AdapterResult, parse_worker_result  # noqa: E402
 from agent_mesh_service import MeshHTTPServer  # noqa: E402
 from sync_shared_catalog import synchronize  # noqa: E402
 
@@ -658,6 +659,31 @@ class AutonomousSupervisorTests(MeshTestCase):
 
     def autonomous_settings(self) -> Settings:
         return replace(make_settings(self.base, autonomy_enabled=True), ack_timeout=5)
+
+    def test_worker_parser_accepts_terminal_framed_json(self) -> None:
+        output = """\
+╭────────────── PROVIDER ──────────────╮
+│  {                                   │
+│    \"action\": \"complete\",        │
+│    \"summary\": \"framed result split │
+│    across a terminal line\",          │
+│    \"files_changed\": [],             │
+│    \"files_created\": [],              │
+│    \"commands_executed\": [],          │
+│    \"tests\": [\"smoke\"],             │
+│    \"warnings\": [],                   │
+│    \"errors\": [],                     │
+│    \"handoff_notes\": []               │
+│  }                                   │
+╰─────────────────────────────────────╯
+"""
+        parsed = parse_worker_result(
+            AdapterResult(agent="Friday-Pro", kind="command", stdout=output)
+        )
+        self.assertIsNotNone(parsed)
+        self.assertEqual(parsed["action"], "complete")
+        self.assertEqual(parsed["summary"], "framed result split across a terminal line")
+        self.assertEqual(parsed["tests"], ["smoke"])
 
     def register_adapter(
         self, name: str, capabilities: list[str], output: dict, **extra

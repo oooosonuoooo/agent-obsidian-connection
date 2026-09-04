@@ -1410,7 +1410,24 @@ def _frame(value: dict[str, Any]) -> bytes:
 
 
 def _json_candidates(text: str) -> list[Any]:
-    cleaned = _ANSI.sub("", str(text or "")).strip()
+    cleaned = _ANSI.sub("", str(text or ""))
+    # Some existing local clients render their response inside a terminal
+    # panel.  The JSON is still valid, but each line is prefixed/suffixed by
+    # the panel's vertical border (for example ``│ { │``).  Normalize only
+    # those line borders so ordinary provider output and JSON strings that
+    # contain ``|`` remain untouched.
+    framed_lines: list[str] = []
+    framed_payload: list[str] = []
+    for line in cleaned.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("│"):
+            stripped = stripped[1:]
+            if stripped.endswith("│"):
+                stripped = stripped[:-1]
+            framed_payload.append(stripped.strip())
+            line = stripped.strip()
+        framed_lines.append(line)
+    cleaned = "\n".join(framed_lines).strip()
     if not cleaned:
         return []
     candidates: list[Any] = []
@@ -1425,29 +1442,42 @@ def _json_candidates(text: str) -> list[Any]:
             seen.add(key)
             candidates.append(value)
 
-    try:
-        add(json.loads(cleaned))
-    except (TypeError, ValueError):
-        pass
-    for line in cleaned.splitlines():
-        line = line.strip()
-        if not line:
-            continue
-        if line.startswith("```"):
-            continue
+    # Fixed-width terminal panels can also wrap a single JSON line in the
+    # middle of a string.  Try the frame payload reassembled without and with
+    # a separator; the former preserves mid-token wraps and the latter covers
+    # clients that wrap only at whitespace.  These variants are only built
+    # from bordered lines, so surrounding HUD prose cannot corrupt a normal
+    # unframed provider response.
+    variants = [cleaned]
+    if framed_payload:
+        variants.extend(
+            [
+                " ".join(framed_payload).strip(),
+                "".join(framed_payload).strip(),
+            ]
+        )
+    for variant in variants:
         try:
-            add(json.loads(line))
+            add(json.loads(variant))
         except (TypeError, ValueError):
-            continue
-    decoder = json.JSONDecoder()
-    for index, char in enumerate(cleaned):
-        if char not in "[{":
-            continue
-        try:
-            value, _ = decoder.raw_decode(cleaned[index:])
-        except (TypeError, ValueError):
-            continue
-        add(value)
+            pass
+        for line in variant.splitlines():
+            line = line.strip()
+            if not line or line.startswith("```"):
+                continue
+            try:
+                add(json.loads(line))
+            except (TypeError, ValueError):
+                continue
+        decoder = json.JSONDecoder()
+        for index, char in enumerate(variant):
+            if char not in "[{":
+                continue
+            try:
+                value, _ = decoder.raw_decode(variant[index:])
+            except (TypeError, ValueError):
+                continue
+            add(value)
     return candidates
 
 
