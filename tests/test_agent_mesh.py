@@ -764,6 +764,85 @@ class AutonomousSupervisorTests(MeshTestCase):
             <= events
         )
 
+    def test_failed_auditor_is_rotated_within_the_same_run(self) -> None:
+        import agent_mesh_adapters
+
+        original_profiles = agent_mesh_adapters.BUILTIN_AGENT_PROFILES
+        agent_mesh_adapters.BUILTIN_AGENT_PROFILES = ()
+
+        def failing_command() -> list[str]:
+            return [
+                sys.executable,
+                "-c",
+                "import sys; print('provider authentication failed', file=sys.stderr); sys.exit(41)",
+            ]
+
+        self.register_adapter(
+            "Worker",
+            ["testing"],
+            {"summary": "No-write worker result."},
+        )
+        self.register_adapter(
+            "GoodAuditor",
+            ["testing"],
+            {"valid": True, "issues": []},
+        )
+        self.register_adapter(
+            "Integrator",
+            ["orchestration"],
+            {"summary": "Integrated after auditor rotation."},
+        )
+        self.register(
+            "BadAuditor",
+            ["testing"],
+            metadata={
+                "autonomy_adapter": {
+                    "kind": "command",
+                    "argv": failing_command(),
+                }
+            },
+        )
+        settings = self.autonomous_settings()
+        store = MeshStore(settings)
+        manager = AutonomyManager(store, settings)
+        try:
+            submitted = manager.submit(
+                {
+                    "objective": "Rotate a failed auditor without creating a nested run",
+                    "lead_agent": "Lead",
+                    "auditor_agent": "BadAuditor",
+                    "integrator_agent": "Integrator",
+                    "workspace": str(self.base),
+                    "plan": {
+                        "tasks": [
+                            {
+                                "task_id": "rotation-task",
+                                "title": "Auditor rotation task",
+                                "description": "Return a structured no-write result.",
+                                "assigned_agent": "Worker",
+                                "required_capabilities": ["testing"],
+                            }
+                        ]
+                    },
+                }
+            )
+            result = self.wait_for_terminal(manager, submitted["id"])
+        finally:
+            manager.stop()
+            agent_mesh_adapters.BUILTIN_AGENT_PROFILES = original_profiles
+
+        self.assertEqual(result["state"], "COMPLETED")
+        events = result["orchestration"]["events"]
+        audit_requested = [
+            event["actor"]
+            for event in events
+            if event["event_type"] == "autonomy.audit_requested"
+        ]
+        self.assertEqual(audit_requested, ["BadAuditor", "GoodAuditor"])
+        self.assertTrue(
+            any(event["event_type"] == "autonomy.audit_failed" for event in events)
+        )
+
     def test_cooperative_agent_waits_for_mcp_worker_and_lead_verification(self) -> None:
         import agent_mesh_adapters
 

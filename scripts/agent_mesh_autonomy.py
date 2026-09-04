@@ -787,13 +787,29 @@ class AutonomyManager:
             with self._lock:
                 if key in self._futures:
                     continue
+            # A present executable is only a preflight signal.  Its real
+            # invocation may still fail because of provider authentication,
+            # entitlement, or a disconnected local session.  Do not select
+            # an auditor that already failed for this task/attempt; rotate to
+            # another healthy adapter in the same durable run.  If there is
+            # no independent adapter left, the second lookup deliberately
+            # permits the worker as a reduced-independence last resort rather
+            # than retrying a known-bad provider forever.
+            failed_auditors = {
+                str(event.get("actor") or "")
+                for event in run.get("events") or []
+                if event.get("event_type") == "autonomy.audit_failed"
+                and str(event.get("task_id") or "") == str(task.get("id") or "")
+                and event.get("actor")
+            }
+            excluded = failed_auditors | {str(task.get("assigned_agent") or "")}
             auditor = self._choose_spec(
                 request,
                 "auditor",
-                {str(task.get("assigned_agent") or "")},
+                excluded,
             )
             if auditor is None:
-                auditor = self._choose_spec(request, "auditor")
+                auditor = self._choose_spec(request, "auditor", failed_auditors)
             if auditor is None:
                 self._wait(
                     request,
