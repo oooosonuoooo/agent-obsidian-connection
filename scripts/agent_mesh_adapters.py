@@ -31,6 +31,42 @@ MAX_PROVIDER_OUTPUT = 2 * 1024 * 1024
 AUTH_STATUS_CACHE_SECONDS = 15.0
 _ANSI = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]")
 
+CLAUDE_WORKER_JSON_SCHEMA = json.dumps(
+    {
+        "type": "object",
+        "properties": {
+            "action": {"type": "string", "enum": ["complete", "delegate"]},
+            "summary": {"type": "string"},
+            "files_changed": {"type": "array", "items": {"type": "string"}},
+            "files_created": {"type": "array", "items": {"type": "string"}},
+            "commands_executed": {"type": "array", "items": {"type": "string"}},
+            "tests": {"type": "array"},
+            "warnings": {"type": "array"},
+            "errors": {"type": "array"},
+            "handoff_notes": {"type": "array"},
+            "subtasks": {"type": "array"},
+            "join_policy": {"type": "string"},
+            "idempotency_key": {"type": "string"},
+        },
+        "required": [
+            "action",
+            "summary",
+            "files_changed",
+            "files_created",
+            "commands_executed",
+            "tests",
+            "warnings",
+            "errors",
+            "handoff_notes",
+        ],
+        "additionalProperties": True,
+    },
+    separators=(",", ":"),
+)
+KILO_AUTOMATION_MODEL = os.environ.get(
+    "AGENT_MESH_KILO_MODEL", "kilo/nvidia/nemotron-3.5-lightning:free"
+)
+
 
 @dataclass(frozen=True)
 class AdapterSpec:
@@ -878,6 +914,7 @@ class AdapterRegistry:
                     command=(
                         executable,
                         "run",
+                        "--pure",
                         "--format",
                         "json",
                         "--auto",
@@ -899,9 +936,12 @@ class AdapterRegistry:
                     command=(
                         executable,
                         "run",
+                        "--pure",
                         "--format",
                         "json",
                         "--auto",
+                        "--model",
+                        KILO_AUTOMATION_MODEL,
                         "--dir",
                         "{workspace}",
                         "{prompt}",
@@ -952,7 +992,10 @@ class AdapterRegistry:
                         "{prompt}",
                         "--output-format",
                         "json",
+                        "--json-schema",
+                        CLAUDE_WORKER_JSON_SCHEMA,
                         "--dangerously-skip-permissions",
+                        "--no-session-persistence",
                     ),
                     model=str(agent.get("model") or ""),
                 )
@@ -1481,7 +1524,7 @@ def _json_candidates(text: str) -> list[Any]:
     return candidates
 
 
-def _walk(value: Any):
+def _walk(value: Any, depth: int = 0):
     yield value
     if isinstance(value, str):
         stripped = value.strip()
@@ -1491,13 +1534,21 @@ def _walk(value: Any):
             except (TypeError, ValueError):
                 nested = None
             if isinstance(nested, (dict, list)):
-                yield from _walk(nested)
+                yield from _walk(nested, depth + 1)
+        elif depth < 2:
+            # JSON event streams often carry the model response in a text
+            # field surrounded by prose or a Markdown fence.  Recover an
+            # embedded object without treating the surrounding text as an
+            # executable instruction.
+            for nested in _json_candidates(stripped):
+                if isinstance(nested, (dict, list)):
+                    yield from _walk(nested, depth + 1)
     elif isinstance(value, dict):
         for child in value.values():
-            yield from _walk(child)
+            yield from _walk(child, depth)
     elif isinstance(value, list):
         for child in value:
-            yield from _walk(child)
+            yield from _walk(child, depth)
 
 
 def _text_from_value(value: Any) -> str:
@@ -1507,7 +1558,16 @@ def _text_from_value(value: Any) -> str:
         parts = [_text_from_value(item) for item in value]
         return "\n".join(part for part in parts if part).strip()
     if isinstance(value, dict):
-        for key in ("summary", "response", "output", "text", "result", "message", "content"):
+        for key in (
+            "summary",
+            "response",
+            "output",
+            "text",
+            "result",
+            "message",
+            "content",
+            "part",
+        ):
             if key in value:
                 text = _text_from_value(value[key])
                 if text:
@@ -1559,7 +1619,10 @@ def parse_worker_result(result: AdapterResult) -> dict[str, Any] | None:
                 return sanitize(nested)
             if str(value.get("summary") or "").strip():
                 return sanitize(value)
-    text = _text_from_value(candidates[0]) if candidates else _ANSI.sub("", result.stdout).strip()
+    text_values = [_text_from_value(candidate) for candidate in candidates]
+    text = max(text_values, key=len, default="")
+    if not text:
+        text = _ANSI.sub("", result.stdout).strip()
     if not text:
         return None
     return {

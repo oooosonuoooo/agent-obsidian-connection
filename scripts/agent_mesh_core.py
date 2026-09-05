@@ -249,12 +249,37 @@ _SECRET_KEY = re.compile(
     r"(?i)(?:api[_-]?key|access[_-]?token|refresh[_-]?token|auth[_-]?token|"
     r"password|passwd|secret|credential)"
 )
+_URL_TEXT = re.compile(r"(?i)(https?://[^\s<>'\"`\x1b]+)")
+
+
+def _redact_url(match: re.Match[str]) -> str:
+    value = match.group(1)
+    trailing = ""
+    while value and value[-1] in ".,;:)]}":
+        trailing = value[-1] + trailing
+        value = value[:-1]
+    try:
+        parsed = urllib.parse.urlsplit(value)
+    except ValueError:
+        return match.group(0)
+    if not parsed.scheme or not parsed.netloc:
+        return match.group(0)
+    host = (parsed.hostname or "").lower()
+    path = parsed.path
+    if host == "app.kilo.ai" and path.startswith("/s/"):
+        path = "/s/[REDACTED]"
+    if parsed.query or parsed.fragment or path != parsed.path:
+        value = urllib.parse.urlunsplit(
+            (parsed.scheme, parsed.netloc, path, "", "")
+        )
+    return value + trailing
 
 
 def redact_text(value: Any) -> str:
     text = str(value)
     text = _AUTH_TEXT.sub(r"\1[REDACTED]", text)
-    return _SECRET_TEXT.sub(r"\1\2[REDACTED]\4", text)
+    text = _SECRET_TEXT.sub(r"\1\2[REDACTED]\4", text)
+    return _URL_TEXT.sub(_redact_url, text)
 
 
 def sanitize(value: Any, key: str | None = None) -> Any:

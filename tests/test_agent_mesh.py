@@ -24,7 +24,13 @@ sys.path.insert(0, str(SCRIPTS))
 
 from agent_mesh_core import MeshError, MeshStore, Settings, redact_text  # noqa: E402
 from agent_mesh_autonomy import AutonomyManager  # noqa: E402
-from agent_mesh_adapters import AdapterResult, parse_worker_result  # noqa: E402
+from agent_mesh_adapters import (  # noqa: E402
+    AdapterRegistry,
+    AdapterResult,
+    CLAUDE_WORKER_JSON_SCHEMA,
+    KILO_AUTOMATION_MODEL,
+    parse_worker_result,
+)
 from agent_mesh_service import MeshHTTPServer  # noqa: E402
 from sync_shared_catalog import synchronize  # noqa: E402
 
@@ -647,6 +653,12 @@ class AgentMeshCoreTests(MeshTestCase):
             ).fetchone()[0]
         self.assertEqual(count, 1)
 
+    def test_secret_redaction_removes_session_urls(self) -> None:
+        value = "diagnostic https://app.kilo.ai/s/fake-session-token.example"
+        redacted = redact_text(value)
+        self.assertEqual(redacted, "diagnostic https://app.kilo.ai/s/[REDACTED]")
+        self.assertNotIn("fake-session-token", redacted)
+
 
 class AutonomousSupervisorTests(MeshTestCase):
     @staticmethod
@@ -684,6 +696,73 @@ class AutonomousSupervisorTests(MeshTestCase):
         self.assertEqual(parsed["action"], "complete")
         self.assertEqual(parsed["summary"], "framed result split across a terminal line")
         self.assertEqual(parsed["tests"], ["smoke"])
+
+    def test_worker_parser_accepts_nested_markdown_json_event(self) -> None:
+        payload = {
+            "action": "complete",
+            "summary": "nested event result",
+            "files_changed": [],
+            "files_created": [],
+            "commands_executed": [],
+            "tests": ["smoke"],
+            "warnings": [],
+            "errors": [],
+            "handoff_notes": [],
+        }
+        output = json.dumps(
+            {
+                "type": "text",
+                "part": {
+                    "type": "text",
+                    "text": "Here is the result:\n```json\n"
+                    + json.dumps(payload)
+                    + "\n```",
+                },
+            }
+        )
+        parsed = parse_worker_result(
+            AdapterResult(agent="Kilo", kind="command", stdout=output)
+        )
+        self.assertIsNotNone(parsed)
+        self.assertEqual(parsed["action"], "complete")
+        self.assertEqual(parsed["summary"], "nested event result")
+
+    def test_claude_adapter_requests_valid_machine_output(self) -> None:
+        registry = AdapterRegistry(self.store, self.settings)
+        spec = registry._builtin(
+            "Claude-FCC",
+            "Anthropic",
+            {"name": "Claude-FCC", "capabilities": {"testing": True}},
+        )
+        self.assertEqual(spec.kind, "command")
+        self.assertIn("--json-schema", spec.command)
+        self.assertIn("--no-session-persistence", spec.command)
+        schema = json.loads(spec.command[spec.command.index("--json-schema") + 1])
+        self.assertEqual(schema, json.loads(CLAUDE_WORKER_JSON_SCHEMA))
+
+    def test_opencode_adapter_uses_pure_headless_mode(self) -> None:
+        registry = AdapterRegistry(self.store, self.settings)
+        spec = registry._builtin(
+            "OpenCode",
+            "OpenCode",
+            {"name": "OpenCode", "capabilities": {"testing": True}},
+        )
+        self.assertEqual(spec.kind, "command")
+        self.assertIn("--pure", spec.command)
+        self.assertIn("--format", spec.command)
+
+    def test_kilo_adapter_uses_current_free_model(self) -> None:
+        registry = AdapterRegistry(self.store, self.settings)
+        spec = registry._builtin(
+            "Kilo",
+            "Kilo Code",
+            {"name": "Kilo", "capabilities": {"testing": True}},
+        )
+        self.assertEqual(spec.kind, "command")
+        self.assertIn("--pure", spec.command)
+        self.assertEqual(
+            spec.command[spec.command.index("--model") + 1], KILO_AUTOMATION_MODEL
+        )
 
     def register_adapter(
         self, name: str, capabilities: list[str], output: dict, **extra
