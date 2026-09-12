@@ -27,6 +27,9 @@ from agent_mesh_autonomy import AutonomyManager  # noqa: E402
 from agent_mesh_adapters import (  # noqa: E402
     AdapterRegistry,
     AdapterResult,
+    AdapterSpec,
+    CLAUDE_AUDIT_JSON_SCHEMA,
+    CLAUDE_PLANNER_JSON_SCHEMA,
     CLAUDE_WORKER_JSON_SCHEMA,
     KILO_AUTOMATION_MODEL,
     parse_worker_result,
@@ -740,6 +743,34 @@ class AutonomousSupervisorTests(MeshTestCase):
         self.assertIn("--no-session-persistence", spec.command)
         schema = json.loads(spec.command[spec.command.index("--json-schema") + 1])
         self.assertEqual(schema, json.loads(CLAUDE_WORKER_JSON_SCHEMA))
+
+    def test_claude_adapter_selects_schema_for_autonomous_role(self) -> None:
+        registry = AdapterRegistry(self.store, self.settings)
+        command = (
+            sys.executable,
+            "-c",
+            "import json,sys; print(json.dumps(sys.argv[1:]))",
+            "--json-schema",
+            CLAUDE_WORKER_JSON_SCHEMA,
+            "{prompt}",
+        )
+        spec = AdapterSpec("Claude-FCC", "command", command, timeout=3)
+        for role, expected in (
+            ("planner", CLAUDE_PLANNER_JSON_SCHEMA),
+            ("auditor", CLAUDE_AUDIT_JSON_SCHEMA),
+            ("worker", CLAUDE_WORKER_JSON_SCHEMA),
+        ):
+            with self.subTest(role=role):
+                result = registry.invoke(
+                    spec,
+                    prompt="Return the role response.",
+                    payload={"role": role},
+                    workspace=self.base,
+                )
+                self.assertTrue(result.ok)
+                argv = json.loads(result.stdout)
+                schema = json.loads(argv[argv.index("--json-schema") + 1])
+                self.assertEqual(schema, json.loads(expected))
 
     def test_opencode_adapter_uses_pure_headless_mode(self) -> None:
         registry = AdapterRegistry(self.store, self.settings)

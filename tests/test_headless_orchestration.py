@@ -129,6 +129,65 @@ class HeadlessOrchestrationTests(unittest.TestCase):
         self.assertEqual(peak, 1)
         self.assertTrue(all(t <= self.settings.autonomy_audit_timeout for t in timeouts))
 
+    def test_consultant_uses_planning_timeout(self):
+        spec = self.provider('Consultant')
+        settings = replace(self.settings, autonomy_planning_timeout=0.2)
+        manager = AutonomyManager(self.store, settings)
+        manager.registry.refresh = lambda: manager.registry._specs
+        captured = []
+
+        def invoke(selected, **kwargs):
+            captured.append(selected.timeout)
+            return AdapterResult(selected.agent, selected.kind, stdout='{"summary":"ok"}')
+
+        manager.registry.invoke = invoke
+        try:
+            result = manager._invoke_provider(
+                spec,
+                prompt='Consult',
+                payload={'role': 'consultant'},
+                workspace=self.base,
+            )
+        finally:
+            manager.stop()
+
+        self.assertTrue(result.ok)
+        self.assertEqual(captured, [settings.autonomy_planning_timeout])
+
+    def test_cancelled_consultation_terminates_provider(self):
+        settings = replace(self.settings, autonomy_planning_timeout=5, autonomy_max_workers=2)
+        manager = AutonomyManager(self.store, settings)
+        manager.registry.refresh = lambda: manager.registry._specs
+        self.store.register_agent({'name': 'Consultant', 'capabilities': ['analysis']})
+        spec = AdapterSpec(
+            'Consultant',
+            'command',
+            (sys.executable, '-c', 'import time; time.sleep(30)'),
+            timeout=1800,
+            heartbeat_interval=0.05,
+            capabilities=('analysis',),
+        )
+        manager.registry._specs['Consultant'] = spec
+        request = self.store.create_autonomous_request({
+            'objective': 'Consult safely',
+            'workspace': str(self.base),
+            'lead_agent': 'Lead',
+        })
+        result = []
+        thread = threading.Thread(
+            target=lambda: result.append(manager._run_consultation(request, spec)),
+            daemon=True,
+        )
+        thread.start()
+        time.sleep(0.15)
+        manager.cancel(request['id'], actor='test')
+        thread.join(timeout=2)
+        try:
+            self.assertFalse(thread.is_alive())
+            self.assertEqual(result[0]['status'], 'failed')
+        finally:
+            manager.stop()
+
     def test_invalid_integrator_cannot_finalize_with_an_aggregation(self):
         spec = self.provider('BrokenIntegrator')
         request = self.store.create_autonomous_request({'objective': 'Integrate actual evidence', 'workspace': str(self.base), 'lead_agent': 'Lead'})

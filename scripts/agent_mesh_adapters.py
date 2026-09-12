@@ -66,6 +66,31 @@ CLAUDE_WORKER_JSON_SCHEMA = json.dumps(
     },
     separators=(",", ":"),
 )
+CLAUDE_PLANNER_JSON_SCHEMA = json.dumps(
+    {
+        "type": "object",
+        "properties": {
+            "tasks": {"type": "array", "items": {"type": "object"}},
+        },
+        "required": ["tasks"],
+        "additionalProperties": True,
+    },
+    separators=(",", ":"),
+)
+CLAUDE_AUDIT_JSON_SCHEMA = json.dumps(
+    {
+        "type": "object",
+        "properties": {
+            "valid": {"type": "boolean"},
+            "issues": {"type": "array"},
+            "revision_instructions": {"type": "string"},
+            "tests_to_run": {"type": "array"},
+        },
+        "required": ["valid", "issues", "revision_instructions", "tests_to_run"],
+        "additionalProperties": True,
+    },
+    separators=(",", ":"),
+)
 KILO_AUTOMATION_MODEL = os.environ.get(
     "AGENT_MESH_KILO_MODEL", "kilo/nvidia/nemotron-3.5-lightning:free"
 )
@@ -1234,7 +1259,7 @@ class AdapterRegistry:
             )
         return self._invoke_command(
             spec, prompt, workspace, heartbeat, cancel_check,
-            task_token=task_token, caller_agent=caller_agent,
+            task_token=task_token, caller_agent=caller_agent, payload=payload,
         )
 
     def _invoke_command(
@@ -1247,8 +1272,11 @@ class AdapterRegistry:
         *,
         task_token: str = "",
         caller_agent: str = "",
+        payload: dict[str, Any] | None = None,
     ) -> AdapterResult:
         argv = _render_argv(spec.command, prompt=prompt, workspace=workspace, agent=spec.agent, model=spec.model)
+        if spec.agent.lower().startswith("claude"):
+            argv = _claude_role_argv(argv, str((payload or {}).get("role") or "worker"))
         started = time.monotonic()
         environment = _headless_environment((spec.auth_env,))
         environment["AGENT_MESH_AUTONOMOUS_AGENT"] = spec.agent
@@ -1575,6 +1603,32 @@ def _render_argv(
     return argv
 
 
+def _claude_role_argv(argv: list[str], role: str) -> list[str]:
+    """Use a schema matching the autonomous role being invoked.
+
+    Claude's structured-output option validates the model response before the
+    mesh parser sees it.  Reusing the worker schema for planning or auditing
+    makes otherwise healthy Claude sessions return an unusable response.
+    """
+    schemas = {
+        "planner": CLAUDE_PLANNER_JSON_SCHEMA,
+        "planner_repair": CLAUDE_PLANNER_JSON_SCHEMA,
+        "auditor": CLAUDE_AUDIT_JSON_SCHEMA,
+    }
+    schema = schemas.get(role)
+    if not schema:
+        return argv
+    try:
+        index = argv.index("--json-schema")
+    except ValueError:
+        return argv
+    if index + 1 >= len(argv):
+        return argv
+    rendered = list(argv)
+    rendered[index + 1] = schema
+    return rendered
+
+
 def _text_chunk(value: Any) -> str:
     if value is None:
         return ""
@@ -1842,6 +1896,25 @@ def _text_from_value(value: Any) -> str:
     return ""
 
 
+def _is_lifecycle_text(text: str) -> bool:
+    """Reject provider lifecycle chatter as a completed worker result."""
+    normalized = re.sub(r"\s+", " ", _ANSI.sub("", str(text or ""))).strip().lower()
+    if not normalized:
+        return True
+    return normalized in {
+        "provider execution started",
+        "provider execution finished",
+        "reading additional input from stdin...",
+        "reading additional input from stdin",
+        "turn started",
+        "turn completed",
+        "thread started",
+        "session started",
+        "item started",
+        "assistant turn started",
+    } or normalized.startswith("provider execution started ")
+
+
 def parse_plan(text: str) -> dict[str, Any] | None:
     for candidate in _json_candidates(text):
         for value in _walk(candidate):
@@ -1884,15 +1957,28 @@ def parse_worker_result(result: AdapterResult) -> dict[str, Any] | None:
             if not isinstance(value, dict):
                 continue
             nested = value.get("result")
-            if isinstance(nested, dict) and str(nested.get("summary") or "").strip():
+            if (
+                isinstance(nested, dict)
+                and str(nested.get("summary") or "").strip()
+                and not _is_lifecycle_text(nested.get("summary"))
+            ):
                 return sanitize(nested)
-            if str(value.get("summary") or "").strip():
+            if (
+                str(value.get("summary") or "").strip()
+                and not _is_lifecycle_text(value.get("summary"))
+            ):
                 return sanitize(value)
     text_values = [_text_from_value(candidate) for candidate in candidates]
-    text = max(text_values, key=len, default="")
+    text = max(
+        (value for value in text_values if not _is_lifecycle_text(value)),
+        key=len,
+        default="",
+    )
     if not text:
+        if candidates:
+            return None
         text = _ANSI.sub("", result.stdout).strip()
-    if not text:
+    if not text or _is_lifecycle_text(text):
         return None
     return {
         "summary": text[:50000],

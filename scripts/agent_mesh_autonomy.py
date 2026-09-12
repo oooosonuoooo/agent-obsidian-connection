@@ -321,6 +321,7 @@ class AutonomyManager:
         role = payload.get("role", "worker")
         timeout = {"planner": self.settings.autonomy_planning_timeout,
                    "planner_repair": self.settings.autonomy_planning_timeout,
+                   "consultant": self.settings.autonomy_planning_timeout,
                    "auditor": self.settings.autonomy_audit_timeout,
                    "integrator": self.settings.autonomy_integration_timeout}.get(role, spec.timeout)
         spec = replace(spec, timeout=min(spec.timeout, timeout, self.settings.autonomy_command_timeout))
@@ -381,6 +382,8 @@ class AutonomyManager:
                     error={},
                 )
                 consultations = self._consult(request, planner)
+                if self._request_cancelled(request_id):
+                    return None
                 self.store.record_event(
                     "autonomy.plan_requested",
                     actor=planner.agent,
@@ -571,6 +574,7 @@ class AutonomyManager:
             prompt=self._consultation_prompt(request, spec),
             payload={"objective": request["objective"], "role": "consultant"},
             workspace=Path(request["workspace"]),
+            cancel_check=lambda: self._request_cancelled(request["id"]),
         )
         result = parse_worker_result(output) if output.ok else None
         if result is None:
@@ -1265,6 +1269,14 @@ class AutonomyManager:
             return
         if current.get("state") != state:
             self.store.update_autonomous_request(request["id"], state=state)
+
+    def _request_cancelled(self, request_id: str) -> bool:
+        if self._stop.is_set():
+            return True
+        try:
+            return self.store.get_autonomous_request(request_id).get("state") in AUTONOMOUS_TERMINAL
+        except MeshError:
+            return True
 
     def _ensure_lead(self, lead_agent: str) -> None:
         try:

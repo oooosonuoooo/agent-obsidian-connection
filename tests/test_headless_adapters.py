@@ -79,6 +79,18 @@ class AdapterFailureTests(unittest.TestCase):
         self.assertTrue(self.result(stdout='The task mentioned "Error: quota exceeded".').ok)
         self.assertTrue(self.result(stdout='> Error: quota exceeded').ok)
 
+    def test_lifecycle_only_output_is_not_a_completed_worker_result(self):
+        outputs = [
+            "provider execution started\n",
+            json.dumps({"type": "task.progress", "summary": "provider execution started"}),
+            json.dumps({"message": "Reading additional input from stdin..."}),
+        ]
+        for output in outputs:
+            with self.subTest(output=output):
+                result = self.result(stdout=output)
+                self.assertTrue(result.ok)
+                self.assertIsNone(parse_worker_result(result))
+
     def test_exit_status_and_empty_output_have_stable_categories(self):
         cases = [
             ({}, "empty_output"),
