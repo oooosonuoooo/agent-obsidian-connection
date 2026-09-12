@@ -13,12 +13,17 @@ VAULT = Path(
         str(Path.home() / "AI-Second-Brain/AI-Second-Brain-Vault"),
     )
 ).resolve()
+MAX_FRAME_BYTES = 2 * 1024 * 1024
+MAX_NOTE_BYTES = 200 * 1024
+MAX_NOTE_LIST = 1000
 
 
 def read_message():
     first = sys.stdin.buffer.readline()
     if not first:
         return None
+    if len(first) > MAX_FRAME_BYTES:
+        raise ValueError("MCP frame exceeds the configured size limit")
     stripped = first.lstrip()
     if stripped.startswith(b"{") or stripped.startswith(b"["):
         return json.loads(first), "line"
@@ -34,6 +39,8 @@ def read_message():
     length = int(headers.get("content-length", "0"))
     if length <= 0:
         return None
+    if length > MAX_FRAME_BYTES:
+        raise ValueError("MCP frame exceeds the configured size limit")
     payload = sys.stdin.buffer.read(length)
     if not payload:
         return None
@@ -57,11 +64,17 @@ def safe_note_path(relative_path: str) -> Path:
 
 
 def notes(limit: int = 200):
-    return sorted(
-        str(path.relative_to(VAULT))
-        for path in VAULT.rglob("*.md")
-        if ".obsidian" not in path.parts
-    )[:limit]
+    limit = max(1, min(int(limit), MAX_NOTE_LIST))
+    values: list[str] = []
+    if not VAULT.exists():
+        return values
+    for path in VAULT.rglob("*.md"):
+        if ".obsidian" in path.parts:
+            continue
+        values.append(str(path.relative_to(VAULT)))
+        if len(values) >= limit:
+            break
+    return sorted(values)
 
 
 TOOLS = [
@@ -122,7 +135,7 @@ def initialize_result(request):
 
 def call_tool(name: str, arguments: dict):
     if name == "obsidian_vault_status":
-        return {"vault": str(VAULT), "exists": VAULT.exists(), "notes": len(notes(100000))}
+        return {"vault": str(VAULT), "exists": VAULT.exists(), "notes": len(notes(MAX_NOTE_LIST))}
     if name == "obsidian_list_notes":
         return notes(int(arguments.get("limit", 200)))
     if name == "obsidian_read_note":
@@ -132,6 +145,8 @@ def call_tool(name: str, arguments: dict):
         path = safe_note_path(arguments["path"])
         path.parent.mkdir(parents=True, exist_ok=True)
         content = arguments["content"]
+        if not isinstance(content, str) or len(content.encode("utf-8")) > MAX_NOTE_BYTES:
+            raise ValueError("note content exceeds the configured size limit")
         if arguments.get("mode") == "append" and path.exists():
             path.write_text(path.read_text(errors="ignore") + "\n" + content)
         else:

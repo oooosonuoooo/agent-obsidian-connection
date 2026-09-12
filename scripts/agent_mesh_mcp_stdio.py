@@ -21,6 +21,7 @@ from pathlib import Path
 BASE = os.environ.get("AGENT_MESH_BASE_URL", "http://127.0.0.1:17860").rstrip("/")
 _AGENT_NAME = ""
 _LEASES: dict[str, str] = {}
+MAX_FRAME_BYTES = 2 * 1024 * 1024
 
 
 def token() -> str | None:
@@ -42,6 +43,8 @@ def read_message():
     first = sys.stdin.buffer.readline()
     if not first:
         return None
+    if len(first) > MAX_FRAME_BYTES:
+        raise ValueError("MCP frame exceeds the configured size limit")
     stripped = first.lstrip()
     if stripped.startswith(b"{") or stripped.startswith(b"["):
         return json.loads(first), "line"
@@ -56,6 +59,8 @@ def read_message():
     length = int(headers.get("content-length", "0"))
     if length <= 0:
         return None
+    if length > MAX_FRAME_BYTES:
+        raise ValueError("MCP frame exceeds the configured size limit")
     payload = sys.stdin.buffer.read(length)
     if not payload:
         return None

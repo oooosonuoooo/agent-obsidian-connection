@@ -10,11 +10,14 @@ an answer when an adapter is unavailable or returns no output.
 from __future__ import annotations
 
 import json
+import ipaddress
 import os
 import re
+import selectors
 import shlex
 import shutil
 import signal
+import socket
 import subprocess
 import time
 import urllib.error
@@ -87,11 +90,11 @@ class AdapterSpec:
     @property
     def available(self) -> bool:
         if self.kind == "command":
-            return bool(self.command) and bool(shutil.which(self.command[0]) or Path(self.command[0]).is_file())
+            return bool(self.command) and bool(_executable(self.command[0]))
         if self.kind == "http":
             return bool(self.endpoint)
         if self.kind == "mcp":
-            return bool(self.command) and bool(shutil.which(self.command[0]) or Path(self.command[0]).is_file()) and bool(self.tool)
+            return bool(self.command) and bool(_executable(self.command[0])) and bool(self.tool)
         if self.kind == "ollama":
             return bool(self.endpoint and self.model)
         return False
@@ -106,10 +109,104 @@ class AdapterResult:
     returncode: int = 0
     timed_out: bool = False
     duration_seconds: float = 0.0
+    cancelled: bool = False
+
+    @property
+    def failure_code(self) -> str:
+        return classify_adapter_failure(self)
 
     @property
     def ok(self) -> bool:
-        return self.returncode == 0 and not self.timed_out and bool(self.stdout.strip())
+        return not self.failure_code
+
+
+def _provider_error_messages(output: str) -> list[str]:
+    """Read error envelopes, without searching quoted prompts or model text."""
+    cleaned = _ANSI.sub("", _bounded(output)).strip()
+    try:
+        documents = [json.loads(cleaned)]
+    except ValueError:
+        documents = []
+        for line in cleaned.splitlines():
+            try:
+                documents.append(json.loads(line))
+            except ValueError:
+                continue
+    errors = []
+    for document in documents:
+        if not isinstance(document, dict):
+            continue
+        if str(document.get("role") or "") in {"user", "system"}:
+            continue
+        # MCP wraps its tool result; ordinary response text is deliberately
+        # not recursively parsed as an error envelope.
+        if isinstance(document.get("result"), dict) and document["result"].get("isError") is True:
+            document = document["result"]
+        event = str(document.get("type") or "").lower()
+        failed = (
+            document.get("is_error") is True
+            or document.get("isError") is True
+            or event in {"error", "failed", "turn.failed", "response.failed", "session.error"}
+            or str(document.get("subtype") or "").startswith("error_")
+        )
+        # A worker's task-level errors/quoted examples are not CLI failures.
+        worker_result = "summary" in document or str(document.get("action") or "") in {"complete", "delegate"}
+        failed = failed or (not worker_result and (
+            bool(document.get("error")) or str(document.get("status") or "") in {"error", "failed"}
+        ))
+        if failed:
+            errors.append(json.dumps({key: value for key, value in document.items()
+                                      if key in {"error", "errors", "message", "code", "name", "type", "subtype", "result", "content"}},
+                                     ensure_ascii=False))
+    return errors
+
+
+def _diagnostic_failure_code(message: str) -> str:
+    message = message.lower()
+    categories = (
+        ("authentication", r"unauthenticated|authentication|not (?:logged|signed) in|invalid[ _-]?(?:api[ _-]?)?key|invalid[ _-]?token|credentials|unauthorized|\b401\b"),
+        ("quota", r"quota|rate[ _-]?limit|resource[ _-]?exhausted|insufficient[ _-]?(?:credits|balance)|(?:no|out of) credits|credits? exhausted|\b429\b"),
+        ("model_unavailable", r"ineligibletier|providermodelnotfound|model.{0,100}(?:not[ _-]?found|unavailable|not available|not supported|does not exist|not installed)|unknown model"),
+        ("permission", r"permission|access denied|forbidden|\b403\b|\beacces\b|\beperm\b"),
+        ("timeout", r"timed? out|timeout|\betimedout\b"),
+        ("cancelled", r"cancelled|canceled|interrupted"),
+        ("network", r"connection|network|\bdns\b|name resolution|could not resolve|failed to fetch|fetch failed|\beconn\w*|\benet\w*|\beai_again\b|service unavailable|\b50[234]\b"),
+        ("unavailable", r"command not found|no such file|not executable|adapter unavailable|command is unavailable"),
+    )
+    for category, pattern in categories:
+        if re.search(pattern, message):
+            return category
+    return "provider_error"
+
+
+def classify_adapter_failure(result: AdapterResult) -> str:
+    """Return a stable failure category, or an empty string for success."""
+    if result.cancelled:
+        return "cancelled"
+    if result.timed_out or result.returncode == 124:
+        return "timeout"
+    messages = _provider_error_messages(result.stdout) + _provider_error_messages(result.stderr)
+    if result.returncode:
+        # Nonzero exits are independently known failures, so their plain
+        # diagnostic text can be classified without mistaking a valid answer.
+        diagnostic = "\n".join(messages) or result.stderr or result.stdout
+        code = _diagnostic_failure_code(_bounded(diagnostic))
+        if code == "provider_error" and result.returncode in {126, 127}:
+            return "unavailable"
+        if code == "provider_error" and result.returncode in {-signal.SIGINT, 130}:
+            return "cancelled"
+        return code
+    if messages:
+        return _diagnostic_failure_code("\n".join(messages))
+    # Some CLIs print a diagnostic and exit zero. Restrict this fallback to
+    # standalone diagnostic lines, never arbitrary JSON fields or quotations.
+    for output in (result.stdout, result.stderr):
+        cleaned = _ANSI.sub("", _bounded(output)).strip()
+        if cleaned.startswith(("{", "[", '"', "```", ">")):
+            continue
+        if re.match(r"(?i)^(?:(?:api )?error\s*:|fatal\s*:|[A-Za-z]*Error\s*:|authentication required\b|not logged in\b|unauthorized\b)", cleaned):
+            return _diagnostic_failure_code(cleaned.splitlines()[0])
+    return "" if result.stdout.strip() else "empty_output"
 
 
 DEFAULT_PROFILE_CAPABILITIES: dict[str, tuple[str, ...]] = {
@@ -272,6 +369,32 @@ def _secret_configured(name: str) -> bool:
     }
 
 
+_SAFE_PROVIDER_ENV = {
+    "HOME", "USER", "LOGNAME", "PATH", "LANG", "LC_ALL", "TMPDIR",
+    "XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_CACHE_HOME", "XDG_RUNTIME_DIR",
+    "DBUS_SESSION_BUS_ADDRESS",
+    "NO_PROXY", "HTTPS_PROXY", "HTTP_PROXY", "https_proxy", "http_proxy",
+    "AGENT_MESH_BASE_URL", "AGENT_MESH_TOKEN", "AGENT_MESH_PORT",
+    "LOCAL_LLM_MODEL", "LOCAL_LLM_OLLAMA_ENDPOINT", "GEMINI_API_KEY",
+    "GOOGLE_API_KEY", "GOOGLE_GENAI_USE_VERTEXAI", "GOOGLE_APPLICATION_CREDENTIALS",
+    "GOOGLE_CLOUD_PROJECT", "GOOGLE_CLOUD_LOCATION", "CURSOR_API_KEY",
+    "KIRO_API_KEY", "OPENAI_API_KEY", "ANTHROPIC_API_KEY", "KILO_API_KEY",
+}
+
+
+def _headless_environment(extra: tuple[str, ...] = ()) -> dict[str, str]:
+    """Preserve only service/provider settings needed by a headless child."""
+    allowed = _SAFE_PROVIDER_ENV | {str(name) for name in extra if name}
+    environment = {
+        name: value for name, value in os.environ.items()
+        if name in allowed
+    }
+    for name in ("DISPLAY", "WAYLAND_DISPLAY", "SWAYSOCK"):
+        environment.pop(name, None)
+    environment["NO_OPEN_BROWSER"] = "1"
+    return environment
+
+
 def _cli_reports_authenticated(command: tuple[str, ...]) -> bool:
     """Check a provider's local login state without opening a browser.
 
@@ -280,8 +403,7 @@ def _cli_reports_authenticated(command: tuple[str, ...]) -> bool:
     session, but they must never start an interactive login flow or expose its
     output in the mesh logs.
     """
-    environment = os.environ.copy()
-    environment["NO_OPEN_BROWSER"] = "1"
+    environment = _headless_environment()
     try:
         result = subprocess.run(
             command,
@@ -291,6 +413,7 @@ def _cli_reports_authenticated(command: tuple[str, ...]) -> bool:
             text=True,
             timeout=1.5,
             env=environment,
+            start_new_session=True,
             check=False,
         )
     except (OSError, subprocess.SubprocessError):
@@ -323,6 +446,8 @@ def _secret_tool_credential_present(service: str, account: str) -> bool:
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
             timeout=1.5,
+            env=_headless_environment(),
+            start_new_session=True,
             check=False,
         )
     except (OSError, subprocess.SubprocessError):
@@ -414,6 +539,40 @@ def _command_tokens(value: Any) -> tuple[str, ...]:
     return ()
 
 
+def _provider_endpoint_allowed(endpoint: str) -> tuple[bool, str]:
+    """Keep registered HTTP adapters on an explicit, non-SSRF allowlist."""
+    try:
+        parsed = urllib.parse.urlsplit(endpoint)
+    except ValueError:
+        return False, "provider endpoint is invalid"
+    if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+        return False, "provider endpoint must use http or https"
+    host = parsed.hostname.lower().rstrip(".")
+    configured = {
+        item.strip().lower().rstrip(".")
+        for item in os.environ.get("AGENT_MESH_ALLOWED_PROVIDER_HOSTS", "").split(",")
+        if item.strip()
+    }
+    local_hosts = {"localhost", "127.0.0.1", "::1"}
+    if host not in local_hosts and host not in configured:
+        return False, "provider endpoint host is not allowlisted"
+    try:
+        addresses = {
+            info[4][0]
+            for info in socket.getaddrinfo(host, parsed.port or (443 if parsed.scheme == "https" else 80), type=socket.SOCK_STREAM)
+        }
+    except OSError:
+        return False, "provider endpoint host could not be resolved"
+    for address in addresses:
+        try:
+            value = ipaddress.ip_address(address)
+        except ValueError:
+            continue
+        if host not in local_hosts and (value.is_private or value.is_loopback or value.is_link_local or value.is_reserved):
+            return False, "provider endpoint resolves to a private address"
+    return True, "provider endpoint is allowlisted"
+
+
 class AdapterRegistry:
     """Resolve configured and known-local providers without per-agent setup."""
 
@@ -467,12 +626,10 @@ class AdapterRegistry:
 
     def _sync_existing_builtin_states(self, specs: dict[str, AdapterSpec]) -> None:
         """Keep persisted readiness aligned with real adapter discovery."""
-        builtin_names = {name for name, _, _ in BUILTIN_AGENT_PROFILES}
         agents = {
             str(agent.get("name")): agent for agent in self.store.list_agents()
         }
-        for name in builtin_names:
-            spec = specs.get(name)
+        for name, spec in specs.items():
             agent = agents.get(name)
             if spec is None or agent is None:
                 continue
@@ -592,24 +749,28 @@ class AdapterRegistry:
     def preflight(self, spec: AdapterSpec) -> tuple[bool, str]:
         """Validate the selected invocation path immediately before dispatch."""
         if spec.kind == "command":
-            if spec.command and (
-                shutil.which(spec.command[0]) or Path(spec.command[0]).is_file()
-            ):
+            if spec.command and _executable(spec.command[0]):
                 return True, "command is executable"
             return False, "configured command is unavailable"
         if spec.kind == "mcp":
             if not spec.command or not spec.tool:
                 return False, "MCP adapter command/tool is incomplete"
-            if not (shutil.which(spec.command[0]) or Path(spec.command[0]).is_file()):
+            if not _executable(spec.command[0]):
                 return False, "MCP adapter command is unavailable"
             return True, "MCP command is executable"
         if spec.kind == "ollama":
+            allowed, reason = _provider_endpoint_allowed(spec.endpoint)
+            if not allowed:
+                return False, reason
             return (
                 (True, "Ollama model is installed")
                 if _ollama_model_available(spec.endpoint, spec.model)
                 else (False, "Ollama model is unavailable")
             )
         if spec.kind == "http":
+            allowed, reason = _provider_endpoint_allowed(spec.endpoint)
+            if not allowed:
+                return False, reason
             try:
                 parsed = urllib.parse.urlsplit(spec.endpoint)
                 if parsed.scheme not in {"http", "https"} or not parsed.netloc:
@@ -780,9 +941,21 @@ class AdapterRegistry:
                 return AdapterSpec(**common, command=command + args, reason="registered MCP adapter has no tool")
             return AdapterSpec(**common, command=command + args, tool=tool)
         if kind in {"http", "ollama"}:
+            endpoint = str(config.get("endpoint") or agent.get("endpoint") or "")
+            allowed, reason = _provider_endpoint_allowed(endpoint)
+            if not allowed:
+                return AdapterSpec(**common, endpoint=endpoint, reason=reason)
+            auth_env = common["auth_env"]
+            allowed_auth = {
+                item.strip()
+                for item in os.environ.get("AGENT_MESH_ALLOWED_PROVIDER_AUTH_ENVS", "").split(",")
+                if item.strip()
+            }
+            if auth_env and auth_env not in allowed_auth:
+                return AdapterSpec(**common, endpoint=endpoint, auth_env="", reason="provider auth reference is not allowlisted")
             return AdapterSpec(
                 **common,
-                endpoint=str(config.get("endpoint") or agent.get("endpoint") or ""),
+                endpoint=endpoint,
                 tool=str(config.get("tool") or ""),
             )
         return AdapterSpec(**common, reason="cooperative agent; waiting for its MCP worker loop")
@@ -1077,7 +1250,7 @@ class AdapterRegistry:
     ) -> AdapterResult:
         argv = _render_argv(spec.command, prompt=prompt, workspace=workspace, agent=spec.agent, model=spec.model)
         started = time.monotonic()
-        environment = os.environ.copy()
+        environment = _headless_environment((spec.auth_env,))
         environment["AGENT_MESH_AUTONOMOUS_AGENT"] = spec.agent
         environment["AGENT_MESH_AGENT_NAME"] = caller_agent or spec.agent
         if task_token:
@@ -1090,7 +1263,6 @@ class AdapterRegistry:
                 stdin=subprocess.DEVNULL,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
-                text=True,
                 start_new_session=True,
             )
         except OSError as exc:
@@ -1101,47 +1273,11 @@ class AdapterRegistry:
                 returncode=127,
                 duration_seconds=time.monotonic() - started,
             )
-        stdout_parts: list[str] = []
-        stderr_parts: list[str] = []
-        timed_out = False
-        interval = max(min(spec.heartbeat_interval, spec.timeout), 0.5)
-        deadline = started + spec.timeout
-        while True:
-            if cancel_check:
-                try:
-                    if cancel_check():
-                        _terminate_process_group(process)
-                        timed_out = True
-                        break
-                except Exception:
-                    pass
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                timed_out = True
-                _terminate_process_group(process)
-                break
-            try:
-                stdout, stderr = process.communicate(timeout=min(interval, remaining))
-                stdout_parts.append(stdout or "")
-                stderr_parts.append(stderr or "")
-                break
-            except subprocess.TimeoutExpired as exc:
-                stdout_parts.append(_text_chunk(exc.stdout))
-                stderr_parts.append(_text_chunk(exc.stderr))
-                if heartbeat:
-                    try:
-                        heartbeat()
-                    except Exception:
-                        pass
-        if timed_out:
-            try:
-                stdout, stderr = process.communicate(timeout=3)
-                stdout_parts.append(stdout or "")
-                stderr_parts.append(stderr or "")
-            except subprocess.TimeoutExpired:
-                _terminate_process_group(process, force=True)
-        output = _bounded("".join(stdout_parts))
-        errors = _bounded("".join(stderr_parts))
+        output, errors, timed_out, cancelled = _capture_process(
+            process, timeout=max(0.0, spec.timeout - (time.monotonic() - started)),
+            heartbeat_interval=spec.heartbeat_interval, heartbeat=heartbeat,
+            cancel_check=cancel_check,
+        )
         return AdapterResult(
             agent=spec.agent,
             kind=spec.kind,
@@ -1149,6 +1285,7 @@ class AdapterRegistry:
             stderr=errors,
             returncode=process.returncode if process.returncode is not None else 124,
             timed_out=timed_out,
+            cancelled=cancelled,
             duration_seconds=time.monotonic() - started,
         )
 
@@ -1163,6 +1300,15 @@ class AdapterRegistry:
         caller_agent: str = "",
     ) -> AdapterResult:
         started = time.monotonic()
+        allowed, reason = _provider_endpoint_allowed(spec.endpoint)
+        if not allowed:
+            return AdapterResult(
+                agent=spec.agent,
+                kind=spec.kind,
+                returncode=403,
+                stderr=reason,
+                duration_seconds=time.monotonic() - started,
+            )
         body = json.dumps(
             sanitize(
                 {
@@ -1230,7 +1376,7 @@ class AdapterRegistry:
         ]
         wire = b"".join(_frame(item) for item in requests)
         try:
-            environment = os.environ.copy()
+            environment = _headless_environment((spec.auth_env,))
             if caller_agent:
                 environment["AGENT_MESH_AGENT_NAME"] = caller_agent
             if task_token:
@@ -1239,7 +1385,7 @@ class AdapterRegistry:
                 # arguments/logs.
                 environment["AGENT_MESH_TASK_TOKEN"] = task_token
             process = subprocess.Popen(
-                list(spec.command),
+                [_executable(spec.command[0]), *spec.command[1:]],
                 cwd=str(workspace),
                 env=environment,
                 stdin=subprocess.PIPE,
@@ -1247,23 +1393,18 @@ class AdapterRegistry:
                 stderr=subprocess.PIPE,
                 start_new_session=True,
             )
-            stdout, stderr = process.communicate(input=wire, timeout=spec.timeout)
-            return AdapterResult(
-                agent=spec.agent,
-                kind=spec.kind,
-                stdout=_bounded(stdout.decode(errors="replace")),
-                stderr=_bounded(stderr.decode(errors="replace")),
-                returncode=process.returncode or 0,
-                duration_seconds=time.monotonic() - started,
+            stdout, stderr, timed_out, cancelled = _capture_process(
+                process, timeout=spec.timeout,
+                heartbeat_interval=spec.heartbeat_interval, input_data=wire,
             )
-        except subprocess.TimeoutExpired:
-            _terminate_process_group(process, force=True)
             return AdapterResult(
                 agent=spec.agent,
                 kind=spec.kind,
-                returncode=124,
-                timed_out=True,
-                stderr="MCP adapter timed out",
+                stdout=stdout,
+                stderr=stderr,
+                returncode=process.returncode or 0,
+                timed_out=timed_out,
+                cancelled=cancelled,
                 duration_seconds=time.monotonic() - started,
             )
         except OSError as exc:
@@ -1286,6 +1427,15 @@ class AdapterRegistry:
         caller_agent: str = "",
     ) -> AdapterResult:
         started = time.monotonic()
+        allowed, reason = _provider_endpoint_allowed(spec.endpoint)
+        if not allowed:
+            return AdapterResult(
+                agent=spec.agent,
+                kind=spec.kind,
+                returncode=403,
+                stderr=reason,
+                duration_seconds=time.monotonic() - started,
+            )
         body = json.dumps(
             {
                 "model": spec.model,
@@ -1363,9 +1513,10 @@ def _ollama_model_available(endpoint: str, model: str) -> bool:
             for item in (document.get("models") or [])
             if isinstance(item, dict)
         }
-        return model in names or any(
-            name.split(":", 1)[0] == model.split(":", 1)[0] for name in names
-        )
+        # Ollama interprets an omitted tag as latest; another quantization or
+        # size sharing the same base name cannot satisfy an explicit tag.
+        expected = model if ":" in model.rsplit("/", 1)[-1] else model + ":latest"
+        return expected in names or (expected == model + ":latest" and model in names)
     except (OSError, urllib.error.URLError, urllib.error.HTTPError, ValueError):
         return False
 
@@ -1417,6 +1568,8 @@ def _render_argv(
                 if marker == "{prompt}":
                     has_prompt = True
         argv.append(rendered)
+    if argv:
+        argv[0] = _executable(argv[0]) or argv[0]
     if not has_prompt:
         argv.append(prompt)
     return argv
@@ -1435,8 +1588,122 @@ def _bounded(value: str, maximum: int = MAX_PROVIDER_OUTPUT) -> str:
     return value if len(value) <= maximum else value[:maximum]
 
 
-def _terminate_process_group(process: subprocess.Popen, force: bool = False) -> None:
-    if process.poll() is not None:
+def _capture_process(
+    process: subprocess.Popen,
+    *,
+    timeout: float,
+    heartbeat_interval: float,
+    heartbeat: Callable[[], None] | None = None,
+    cancel_check: Callable[[], bool] | None = None,
+    input_data: bytes | None = None,
+) -> tuple[str, str, bool, bool]:
+    """Drain bounded byte buffers, retaining each output byte only once.
+
+    communicate() retains all output internally and TimeoutExpired exposes a
+    cumulative snapshot. Reading nonblocking pipes avoids both unbounded
+    capture and repeated snapshots across heartbeat intervals.
+    """
+    buffers = {"stdout": bytearray(), "stderr": bytearray()}
+    selector = selectors.DefaultSelector()
+    pending_input = memoryview(input_data or b"")
+    timed_out = cancelled = False
+    deadline = time.monotonic() + timeout
+    interval = max(0.05, heartbeat_interval)
+    next_heartbeat = time.monotonic() + interval
+    terminate_deadline: float | None = None
+    drain_deadline: float | None = None
+
+    def close_stream(stream: Any) -> None:
+        selector.unregister(stream)
+        stream.close()
+
+    try:
+        for name in ("stdout", "stderr"):
+            stream = getattr(process, name)
+            if stream is not None:
+                os.set_blocking(stream.fileno(), False)
+                selector.register(stream, selectors.EVENT_READ, name)
+        if process.stdin is not None:
+            if pending_input:
+                os.set_blocking(process.stdin.fileno(), False)
+                selector.register(process.stdin, selectors.EVENT_WRITE, "stdin")
+            else:
+                process.stdin.close()
+        while selector.get_map() or process.poll() is None:
+            now = time.monotonic()
+            running = process.poll() is None
+            if running and terminate_deadline is None:
+                if cancel_check:
+                    try:
+                        cancelled = bool(cancel_check())
+                    except Exception:
+                        pass
+                timed_out = not cancelled and now >= deadline
+                if cancelled or timed_out:
+                    _terminate_process_group(process)
+                    terminate_deadline = now + 1.0
+            if terminate_deadline is not None and now >= terminate_deadline and running:
+                _terminate_process_group(process, force=True)
+                break
+            if not running:
+                # Descendants may retain inherited pipes after the CLI exits.
+                # Drain queued bytes, then clean up that isolated process group.
+                if drain_deadline is None:
+                    drain_deadline = now + 0.25
+                if now >= drain_deadline:
+                    _terminate_process_group(process, force=True, include_descendants=True)
+                    break
+            if running and now >= next_heartbeat:
+                if heartbeat:
+                    try:
+                        heartbeat()
+                    except Exception:
+                        pass
+                next_heartbeat = now + interval
+            wait = min(0.1, max(0.0, next_heartbeat - now)) if running else 0.05
+            for key, _ in selector.select(wait):
+                stream, name = key.fileobj, key.data
+                try:
+                    if name == "stdin":
+                        written = os.write(stream.fileno(), pending_input[:65536])
+                        pending_input = pending_input[written:]
+                        if not pending_input:
+                            close_stream(stream)
+                    else:
+                        chunk = os.read(stream.fileno(), 65536)
+                        if not chunk:
+                            close_stream(stream)
+                        else:
+                            remaining = MAX_PROVIDER_OUTPUT - len(buffers[name])
+                            if remaining > 0:
+                                buffers[name].extend(chunk[:remaining])
+                except BlockingIOError:
+                    continue
+                except OSError:
+                    close_stream(stream)
+    finally:
+        if process.poll() is None or selector.get_map():
+            _terminate_process_group(process, force=True, include_descendants=True)
+        for key in list(selector.get_map().values()):
+            close_stream(key.fileobj)
+        selector.close()
+        try:
+            process.wait(timeout=1.0)
+        except subprocess.TimeoutExpired:
+            _terminate_process_group(process, force=True)
+            process.wait(timeout=1.0)
+    return (
+        buffers["stdout"].decode(errors="replace"),
+        buffers["stderr"].decode(errors="replace"),
+        timed_out,
+        cancelled,
+    )
+
+
+def _terminate_process_group(
+    process: subprocess.Popen, force: bool = False, *, include_descendants: bool = False
+) -> None:
+    if process.poll() is not None and not include_descendants:
         return
     try:
         os.killpg(process.pid, signal.SIGKILL if force else signal.SIGTERM)
@@ -1609,6 +1876,8 @@ def parse_audit(text: str) -> dict[str, Any] | None:
 
 
 def parse_worker_result(result: AdapterResult) -> dict[str, Any] | None:
+    if not result.ok:
+        return None
     candidates = _json_candidates(result.stdout)
     for candidate in candidates:
         for value in _walk(candidate):

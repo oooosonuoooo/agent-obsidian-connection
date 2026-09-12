@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import json
+import hmac
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -193,6 +194,12 @@ class MeshRequestHandler(BaseHTTPRequestHandler):
             return False
         return True
 
+    def administrator_authorized(self) -> bool:
+        """Require a separate, explicitly configured credential for adapters."""
+        expected = self.server.settings.admin_token
+        supplied = self.headers.get("X-Agent-Mesh-Admin", "")
+        return bool(expected) and hmac.compare_digest(supplied, expected)
+
     def request_body(self) -> dict:
         try:
             length = int(self.headers.get("Content-Length", "0"))
@@ -200,20 +207,23 @@ class MeshRequestHandler(BaseHTTPRequestHandler):
             raise MeshError("invalid Content-Length") from exc
         if length < 0 or length > self.server.settings.max_body_bytes:
             raise MeshError("request body is too large", 413)
-        if length == 0:
-            return {}
         try:
-            value = json.loads(self.rfile.read(length).decode("utf-8"))
+            value = json.loads(self.rfile.read(length).decode("utf-8")) if length else {}
         except (UnicodeDecodeError, json.JSONDecodeError) as exc:
             raise MeshError("request body must be valid JSON") from exc
         if not isinstance(value, dict):
             raise MeshError("request body must be a JSON object")
         caller = self.headers.get("X-Agent-Mesh-Agent", "").strip()
         lease = self.headers.get("X-Agent-Mesh-Task-Lease", "").strip()
+        # Internal transport metadata is never accepted from an untrusted body.
+        for key in list(value):
+            if key.startswith("_"):
+                value.pop(key)
+        value["_http_request"] = True
         if caller:
-            value.setdefault("_caller_agent", caller)
+            value["_caller_agent"] = caller
         if lease:
-            value.setdefault("_lease_token", lease)
+            value["_lease_token"] = lease
         return value
 
     @staticmethod
@@ -356,6 +366,9 @@ class MeshRequestHandler(BaseHTTPRequestHandler):
             data = self.request_body()
 
             if path == "/agents/register":
+                metadata = data.get("metadata") if isinstance(data.get("metadata"), dict) else {}
+                if (data.get("autonomy_adapter") is not None or metadata.get("autonomy_adapter") is not None) and not self.administrator_authorized():
+                    raise MeshError("administrator authorization is required to register an executable adapter", 403)
                 return self.respond(self.store.register_agent(data))
             if path == "/agents/heartbeat":
                 name = data.get("agent") or data.get("agent_name") or data.get("name")
@@ -387,7 +400,10 @@ class MeshRequestHandler(BaseHTTPRequestHandler):
             if len(parts) == 4 and parts[:2] == ["orchestration", "runs"]:
                 run_id = parts[2]
                 if parts[3] == "cancel":
-                    return self.respond(self.store.cancel_run(run_id, data.get("actor", "orchestrator")))
+                    actor = data.get("_caller_agent")
+                    if not actor and not self.administrator_authorized():
+                        raise MeshError("caller identity is required", 403)
+                    return self.respond(self.store.cancel_run(run_id, actor or "administrator"))
                 if parts[3] == "finalize":
                     return self.respond(self.store.finalize_run(run_id, data))
                 if parts[3] in {"advance", "dispatch"}:
@@ -397,18 +413,27 @@ class MeshRequestHandler(BaseHTTPRequestHandler):
             if len(parts) == 4 and parts[:2] == ["autonomous", "runs"]:
                 request_id = parts[2]
                 if parts[3] == "cancel":
+                    actor = data.get("_caller_agent")
+                    if not actor and not self.administrator_authorized():
+                        raise MeshError("caller identity is required", 403)
                     return self.respond(
-                        self.server.autonomy.cancel(request_id, data.get("actor", "orchestrator"))
+                        self.server.autonomy.cancel(request_id, actor or "administrator")
                     )
                 if parts[3] == "resume":
                     return self.respond(self.server.autonomy.resume(request_id, data))
 
             if path in {"/tasks/poll", "/agents/tasks/poll"}:
                 agent = data.get("agent") or data.get("agent_id") or data.get("agent_name")
+                if not data.get("_caller_agent"):
+                    raise MeshError("caller identity header is required", 403)
+                if data["_caller_agent"] != agent:
+                    raise MeshError("caller does not match requested worker", 403)
                 return self.respond(
                     self.store.poll_tasks(
                         agent,
-                        data.get("limit", 1),
+                        # The transport returns one lease header. Deliver one
+                        # task at a time so no claimed task loses its token.
+                        1,
                         data.get("task_id") or data.get("task_key"),
                     )
                 )
@@ -434,10 +459,29 @@ class MeshRequestHandler(BaseHTTPRequestHandler):
             if len(parts) >= 3 and parts[0] == "tasks":
                 reference = parts[1]
                 action = parts[2]
+                if action in {"heartbeat", "ack", "progress", "started", "result", "complete", "error", "fail"}:
+                    caller = data.get("_caller_agent")
+                    claimed = data.get("agent") or data.get("agent_name")
+                    if not caller:
+                        raise MeshError("caller identity header is required", 403)
+                    if claimed and claimed != caller:
+                        raise MeshError("caller does not match task worker", 403)
+                    data["agent"] = caller
                 if action == "claim":
+                    if self.store.get_task(reference).get("run_id"):
+                        raise MeshError("orchestration tasks must use the scoped poll/ACK protocol", 409)
+                    if not data.get("_caller_agent"):
+                        raise MeshError("caller identity header is required", 403)
+                    requested = data.get("agent") or data.get("agent_name") or data.get("lease_owner")
+                    if data["_caller_agent"] != requested:
+                        raise MeshError("caller does not match requested worker", 403)
                     return self.respond(self.store.claim_legacy_task(reference, data))
                 if action == "release":
-                    return self.respond(self.store.release_task(reference))
+                    if self.store.get_task(reference).get("run_id"):
+                        raise MeshError("orchestration leases cannot be released through the legacy API", 409)
+                    if not data.get("_caller_agent"):
+                        raise MeshError("caller identity header is required", 403)
+                    return self.respond(self.store.release_task(reference, data["_caller_agent"]))
                 if action == "heartbeat":
                     return self.respond(self.store.heartbeat_task(reference, data))
                 if action == "ack":
@@ -451,8 +495,11 @@ class MeshRequestHandler(BaseHTTPRequestHandler):
                 if action == "verify":
                     return self.respond(self.store.verify_task(reference, data))
                 if action == "cancel":
+                    actor = data.get("_caller_agent")
+                    if not actor and not self.administrator_authorized():
+                        raise MeshError("caller identity is required", 403)
                     return self.respond(
-                        self.store.cancel_task(reference, data.get("actor", "orchestrator"))
+                        self.store.cancel_task(reference, actor or "administrator")
                     )
                 if action in {"dispatch", "send"}:
                     task = self.store.get_task(reference)
@@ -526,6 +573,7 @@ class MeshRequestHandler(BaseHTTPRequestHandler):
                     SELECT * FROM memory
                     WHERE title LIKE ? OR body LIKE ? OR source LIKE ?
                     ORDER BY updated_at DESC
+                    LIMIT 100
                     """,
                     (query, query, query),
                 )
@@ -550,6 +598,8 @@ class MeshRequestHandler(BaseHTTPRequestHandler):
         ]
 
     def _create_handoff(self, data: dict) -> dict:
+        request = redact_text(data.get("request") or "")[:100000]
+        response = redact_text(data.get("response") or "")[:100000]
         with self.store.transaction() as database:
             task_id = self.store._resolve_task_id(
                 database, data.get("task_id"), required=False
@@ -565,8 +615,8 @@ class MeshRequestHandler(BaseHTTPRequestHandler):
                     task_id,
                     redact_text(data.get("from_agent") or "unknown"),
                     redact_text(data.get("to_agent") or "any-capable-agent"),
-                    redact_text(data.get("request") or ""),
-                    redact_text(data.get("response") or ""),
+                    request,
+                    response,
                     redact_text(data.get("status") or "requested"),
                     now,
                     now,
@@ -581,6 +631,10 @@ class MeshRequestHandler(BaseHTTPRequestHandler):
         return row
 
     def _create_memory(self, data: dict) -> dict:
+        title = redact_text(data.get("title") or "")[:1000]
+        category = redact_text(data.get("category") or "")[:200]
+        body = redact_text(data.get("body") or "")[:100000]
+        source = redact_text(data.get("source") or "")[:2000]
         with self.store.transaction() as database:
             now = utc_now()
             database.execute(
@@ -590,10 +644,10 @@ class MeshRequestHandler(BaseHTTPRequestHandler):
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
-                    redact_text(data.get("title") or ""),
-                    redact_text(data.get("category") or ""),
-                    redact_text(data.get("body") or ""),
-                    redact_text(data.get("source") or ""),
+                    title,
+                    category,
+                    body,
+                    source,
                     data.get("confidence"),
                     redact_text(data.get("sensitivity") or ""),
                     now,

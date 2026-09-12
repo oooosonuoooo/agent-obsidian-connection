@@ -14,6 +14,7 @@ import hashlib
 import json
 import threading
 from concurrent.futures import Future, ThreadPoolExecutor, as_completed
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
@@ -65,6 +66,7 @@ class AutonomyManager:
         self._wake = threading.Event()
         self._lock = threading.RLock()
         self._futures: dict[str, Future] = {}
+        self._provider_slots: dict[str, threading.BoundedSemaphore] = {}
         self._executor = ThreadPoolExecutor(
             max_workers=settings.autonomy_max_workers,
             thread_name_prefix="agent-mesh-autonomy",
@@ -230,10 +232,13 @@ class AutonomyManager:
             return
         try:
             if not request.get("orchestration_run_id"):
-                run = self._plan(request)
-                if run is None:
-                    return
-                request = self.store.get_autonomous_request(request_id)
+                # Provider planning must not stop the scheduler from advancing
+                # unrelated durable runs or noticing lost GUI heartbeats.
+                key = "plan:" + request_id
+                with self._lock:
+                    if key not in self._futures:
+                        self._futures[key] = self._executor.submit(self._plan_safely, request)
+                return
             run_id = request.get("orchestration_run_id")
             if not run_id:
                 return
@@ -302,6 +307,53 @@ class AutonomyManager:
         except Exception as exc:
             self._block(request, "autonomous supervisor could not advance the run", request.get("orchestration_run_id"), exc)
 
+    def _plan_safely(self, request: dict[str, Any]) -> None:
+        try:
+            run = self._plan(request)
+            if run is not None:
+                self._advance(self.store.get_autonomous_request(request["id"]))
+        except Exception as exc:
+            self._block(request, "planning failed: " + redact_text(str(exc)), None)
+
+    def _invoke_provider(self, spec: AdapterSpec, **kwargs) -> AdapterResult:
+        """Bound all roles, share provider capacity, and persist real outcomes."""
+        payload = kwargs.get("payload") or {}
+        role = payload.get("role", "worker")
+        timeout = {"planner": self.settings.autonomy_planning_timeout,
+                   "planner_repair": self.settings.autonomy_planning_timeout,
+                   "auditor": self.settings.autonomy_audit_timeout,
+                   "integrator": self.settings.autonomy_integration_timeout}.get(role, spec.timeout)
+        spec = replace(spec, timeout=min(spec.timeout, timeout, self.settings.autonomy_command_timeout))
+        resource = "local-inference" if "local_private" in spec.capabilities else spec.agent
+        with self._lock:
+            slot = self._provider_slots.setdefault(resource, threading.BoundedSemaphore(
+                1 if resource == "local-inference" else spec.max_concurrent_tasks))
+        heartbeat = kwargs.get("heartbeat")
+        cancel_check = kwargs.get("cancel_check")
+        while not slot.acquire(timeout=0.5):
+            if self._stop.is_set() or (cancel_check and cancel_check()):
+                return AdapterResult(spec.agent, spec.kind, returncode=143, stderr="cancelled before execution")
+            if heartbeat:
+                heartbeat()
+        try:
+            output = self.registry.invoke(spec, **kwargs)
+            parsed = None
+            if output.ok:
+                if role in {"planner", "planner_repair"}:
+                    parsed = parse_plan(output.stdout)
+                elif role == "auditor":
+                    parsed = parse_audit(output.stdout)
+                else:
+                    parsed = parse_worker_result(output)
+            success = output.ok and parsed is not None
+            self.store.record_provider_outcome(
+                spec.agent, success=success, duration_seconds=output.duration_seconds,
+                detail=output.stderr or ("invalid structured provider response" if not success else ""),
+                failure_kind=getattr(output, "failure_code", "") or ("malformed_result" if not success else ""))
+            return output
+        finally:
+            slot.release()
+
     def _plan(self, request: dict[str, Any]) -> dict[str, Any] | None:
         request_id = request["id"]
         self._set_state(request, "PLANNING")
@@ -338,24 +390,32 @@ class AutonomyManager:
                         "consultation_count": len(consultations),
                     },
                 )
-                output = self.registry.invoke(
+                output = self._invoke_provider(
                     planner,
                     prompt=self._planner_prompt(request, consultations),
                     payload={"objective": request["objective"], "role": "planner"},
                     workspace=Path(request["workspace"]),
                 )
-                raw_plan = parse_plan(output.stdout) if output.returncode == 0 else None
+                raw_plan = parse_plan(output.stdout) if output.ok else None
                 if raw_plan is None:
-                    repair = self.registry.invoke(
+                    repair = self._invoke_provider(
                         planner,
                         prompt=self._planner_repair_prompt(request),
                         payload={"objective": request["objective"], "role": "planner_repair"},
                         workspace=Path(request["workspace"]),
                     )
-                    raw_plan = parse_plan(repair.stdout) if repair.returncode == 0 else None
+                    raw_plan = parse_plan(repair.stdout) if repair.ok else None
                 if raw_plan is None:
                     detail = output.stderr or "planner returned no valid task DAG"
-                    self._block(request, "planner did not return a valid task DAG: " + redact_text(detail), None)
+                    self.store.record_event("autonomy.planner_failed", actor=planner.agent,
+                        payload={"autonomous_request_id": request_id, "reason": redact_text(detail)})
+                    current = self.store.get_autonomous_request(request_id)
+                    failures = int(current.get("round") or 0) + 1
+                    if failures > int(current.get("max_rounds") or self.settings.autonomy_max_rounds):
+                        self._block(request, "planner retries exhausted: " + redact_text(detail), None)
+                    else:
+                        self.store.update_autonomous_request(request_id, state="WAITING", round_number=failures,
+                            error={"message": "planner failed; selecting another available provider"})
                     return None
         elif original.get("consultation") is True or original.get("consultation_agents"):
             planner = self._choose_spec(request, "planner")
@@ -506,13 +566,13 @@ class AutonomyManager:
     def _run_consultation(
         self, request: dict[str, Any], spec: AdapterSpec
     ) -> dict[str, Any]:
-        output = self.registry.invoke(
+        output = self._invoke_provider(
             spec,
             prompt=self._consultation_prompt(request, spec),
             payload={"objective": request["objective"], "role": "consultant"},
             workspace=Path(request["workspace"]),
         )
-        result = parse_worker_result(output) if output.returncode == 0 else None
+        result = parse_worker_result(output) if output.ok else None
         if result is None:
             return {
                 "agent": spec.agent,
@@ -629,8 +689,8 @@ class AutonomyManager:
                     return True
 
             request = self.store.get_autonomous_request(request_id)
-            output = self.registry.invoke(
-                spec,
+            output = self._invoke_provider(
+                replace(spec, timeout=min(spec.timeout, float(task.get("execution_timeout_seconds") or spec.timeout))),
                 prompt=self._worker_prompt(request, item["execution"]),
                 payload=item["execution"],
                 workspace=Path(request["workspace"]),
@@ -639,7 +699,7 @@ class AutonomyManager:
                 task_token=lease_token,
                 caller_agent=spec.agent,
             )
-            if output.returncode != 0 or output.timed_out:
+            if not output.ok:
                 self._worker_failure(
                     reference,
                     spec.agent,
@@ -792,9 +852,7 @@ class AutonomyManager:
             # entitlement, or a disconnected local session.  Do not select
             # an auditor that already failed for this task/attempt; rotate to
             # another healthy adapter in the same durable run.  If there is
-            # no independent adapter left, the second lookup deliberately
-            # permits the worker as a reduced-independence last resort rather
-            # than retrying a known-bad provider forever.
+            # no independent adapter left, preserve the result and wait.
             failed_auditors = {
                 str(event.get("actor") or "")
                 for event in run.get("events") or []
@@ -809,22 +867,12 @@ class AutonomyManager:
                 excluded,
             )
             if auditor is None:
-                auditor = self._choose_spec(request, "auditor", failed_auditors)
-            if auditor is None:
                 self._wait(
                     request,
                     "no auditor adapter is available; the lead or a cooperative agent must verify the submitted result",
                     run["id"],
                 )
                 continue
-            if auditor.agent == str(task.get("assigned_agent") or ""):
-                self.store.record_event(
-                    "autonomy.audit_reduced_independence",
-                    actor=auditor.agent,
-                    run_id=run["id"],
-                    task_id=task.get("id"),
-                    payload={"reason": "no separate healthy auditor adapter was available"},
-                )
             self.store.update_autonomous_request(
                 request["id"], auditor_agent=auditor.agent, state="AUDITING"
             )
@@ -856,13 +904,13 @@ class AutonomyManager:
                 task_id=task.get("id"),
                 payload={"adapter_kind": auditor.kind, "attempt": task.get("attempt")},
             )
-            output = self.registry.invoke(
+            output = self._invoke_provider(
                 auditor,
                 prompt=self._audit_prompt(request, task),
                 payload={"task": task, "role": "auditor"},
                 workspace=Path(request["workspace"]),
             )
-            audit = parse_audit(output.stdout) if output.returncode == 0 else None
+            audit = parse_audit(output.stdout) if output.ok else None
             if audit is None:
                 current = self.store.get_autonomous_request(request_id)
                 failure_round = int(current.get("round") or 0) + 1
@@ -976,6 +1024,9 @@ class AutonomyManager:
             if key in self._futures:
                 return
         integrator = self._choose_spec(request, "integrator")
+        if integrator is None:
+            self._wait(request, "waiting for a healthy integrator; verified results are preserved", run["id"])
+            return
         self.store.update_autonomous_request(
             request["id"],
             state="INTEGRATING",
@@ -1051,22 +1102,31 @@ class AutonomyManager:
         provider_result: dict[str, Any] | None = None
         integration_warning = ""
         if integrator is not None and integrator.available:
-            output = self.registry.invoke(
+            output = self._invoke_provider(
                 integrator,
                 prompt=self._integration_prompt(request, run, task_reports),
                 payload={"run_id": run_id, "task_reports": task_reports, "role": "integrator"},
                 workspace=Path(request["workspace"]),
             )
-            if output.returncode == 0:
+            if output.ok:
                 provider_result = parse_worker_result(output)
                 if provider_result is not None:
                     provider_result = _normalize_result(provider_result)
             if provider_result is None:
-                integration_warning = "integrator returned no structured report; using verified task evidence"
+                self.store.record_event("autonomy.integration_failed", actor=integrator.agent,
+                    run_id=run_id, payload={"reason": "integrator returned no valid structured report"})
+                self._wait(request, "integrator failed; selecting another healthy provider", run_id)
+                return
             if output.stderr.strip():
                 warnings.append("Integrator diagnostics: " + redact_text(output.stderr[-2000:]))
         else:
-            integration_warning = "no lead/integrator adapter was available; final report is an evidence aggregation"
+            self._wait(request, "waiting for a healthy integrator; verified results are preserved", run_id)
+            return
+        if provider_result.get("errors") or provider_result.get("status") in {"failed", "rejected", "blocked"}:
+            self.store.record_event("autonomy.integration_rejected", actor=integrator.agent,
+                run_id=run_id, payload={"reason": "integrator reported unresolved errors"})
+            self._block(request, "integrator reported unresolved errors; verified task results are preserved", run_id)
+            return
         current_request = self.store.get_autonomous_request(request_id)
         current_run = self.store.get_run(run_id)
         if (
@@ -1108,6 +1168,8 @@ class AutonomyManager:
             }
         )
         try:
+            self.store.record_event("autonomy.integration_passed", actor=integrator.agent,
+                run_id=run_id, payload={"accepted": True, "mode": "provider"})
             self.store.finalize_run(
                 run_id,
                 {"finalized_by": request["lead_agent"], "result": final_result},
@@ -1173,7 +1235,7 @@ class AutonomyManager:
             preferred = request.get("lead_agent")
         if preferred and str(preferred) not in exclude:
             spec = self.registry.get(str(preferred))
-            if spec and spec.available and spec.kind in EXECUTABLE_ADAPTER_KINDS:
+            if spec and self._spec_routable(spec):
                 return spec
         preferred_order = ["Gemini", "OpenCode", "Claude-FCC", "Friday-Pro", "Friday"]
         candidates = self.registry.available()
@@ -1184,9 +1246,18 @@ class AutonomyManager:
             )
         )
         for spec in candidates:
-            if spec.agent not in exclude and spec.kind in EXECUTABLE_ADAPTER_KINDS:
+            if spec.agent not in exclude and self._spec_routable(spec):
                 return spec
         return None
+
+    def _spec_routable(self, spec: AdapterSpec) -> bool:
+        if not spec.available or spec.kind not in EXECUTABLE_ADAPTER_KINDS:
+            return False
+        try:
+            agent = self.store.get_agent(spec.agent)
+            return self.store.agent_health(agent) != "offline"
+        except MeshError:
+            return False
 
     def _set_state(self, request: dict[str, Any], state: str) -> None:
         current = self.store.get_autonomous_request(request["id"])

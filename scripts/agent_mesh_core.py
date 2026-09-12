@@ -121,6 +121,7 @@ class Settings:
     max_delegation_depth: int
     reaper_interval: float
     max_body_bytes: int
+    admin_token: str | None = None
     max_delegation_children: int = 8
     max_delegation_batches: int = 3
     max_run_tasks: int = 64
@@ -129,6 +130,9 @@ class Settings:
     autonomy_max_workers: int = 4
     autonomy_max_rounds: int = 3
     autonomy_command_timeout: float = 1800.0
+    autonomy_planning_timeout: float = 180.0
+    autonomy_audit_timeout: float = 180.0
+    autonomy_integration_timeout: float = 180.0
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -165,6 +169,7 @@ class Settings:
             host="127.0.0.1",
             port=integer("AGENT_MESH_PORT", 17860, 1),
             token=os.environ.get("AGENT_MESH_TOKEN"),
+            admin_token=os.environ.get("AGENT_MESH_ADMIN_TOKEN"),
             ack_timeout=number("AGENT_ACK_TIMEOUT", 30.0, 0.1),
             execution_timeout=number("AGENT_EXECUTION_TIMEOUT", 1800.0, 1.0),
             max_retries=integer("AGENT_MAX_RETRIES", 2, 0),
@@ -185,6 +190,9 @@ class Settings:
             autonomy_command_timeout=number(
                 "AGENT_MESH_AUTONOMY_COMMAND_TIMEOUT", 1800.0, 1.0
             ),
+            autonomy_planning_timeout=number("AGENT_MESH_PLANNING_TIMEOUT", 180.0, 1.0),
+            autonomy_audit_timeout=number("AGENT_MESH_AUDIT_TIMEOUT", 180.0, 1.0),
+            autonomy_integration_timeout=number("AGENT_MESH_INTEGRATION_TIMEOUT", 180.0, 1.0),
         )
 
 
@@ -245,9 +253,14 @@ _SECRET_TEXT = re.compile(
     r"password|passwd|secret|credential)\b[\"']?\s*[:=]\s*)([\"']?)([^,\s}\"']+)(\2)"
 )
 _AUTH_TEXT = re.compile(r"(?i)(\bAuthorization\s*:\s*Bearer\s+)[^\s,}\"']+")
+_JWT_TEXT = re.compile(r"\beyJ[A-Za-z0-9_-]{6,}\.[A-Za-z0-9_-]{6,}\.[A-Za-z0-9_-]{6,}\b")
+_PRIVATE_KEY_TEXT = re.compile(r"-----BEGIN (?:[A-Z0-9 ]+ )?PRIVATE KEY-----.*?-----END (?:[A-Z0-9 ]+ )?PRIVATE KEY-----", re.DOTALL)
+_COOKIE_TEXT = re.compile(r"(?im)(\b(?:Set-Cookie|Cookie)\s*:\s*)[^\r\n\"']+")
+_BARE_BEARER_TEXT = re.compile(r"(?i)(\bBearer\s+)[A-Za-z0-9._~+/-]{8,}={0,2}")
+_PROVIDER_KEY_TEXT = re.compile(r"\b(?:sk-[A-Za-z0-9_-]{16,}|AIza[A-Za-z0-9_-]{20,}|gh[pousr]_[A-Za-z0-9_]{20,}|github_pat_[A-Za-z0-9_]{20,})\b")
 _SECRET_KEY = re.compile(
     r"(?i)(?:api[_-]?key|access[_-]?token|refresh[_-]?token|auth[_-]?token|"
-    r"password|passwd|secret|credential)"
+    r"password|passwd|secret|credential|authorization|cookie|(?:^|[_-])(?:token|jwt)(?:$|[_-]))"
 )
 _URL_TEXT = re.compile(r"(?i)(https?://[^\s<>'\"`\x1b]+)")
 
@@ -256,6 +269,8 @@ def _redact_url(match: re.Match[str]) -> str:
     value = match.group(1)
     trailing = ""
     while value and value[-1] in ".,;:)]}":
+        if value.endswith("[REDACTED]"):
+            break
         trailing = value[-1] + trailing
         value = value[:-1]
     try:
@@ -268,16 +283,22 @@ def _redact_url(match: re.Match[str]) -> str:
     path = parsed.path
     if host == "app.kilo.ai" and path.startswith("/s/"):
         path = "/s/[REDACTED]"
-    if parsed.query or parsed.fragment or path != parsed.path:
+    netloc = parsed.netloc.rsplit("@", 1)[-1]
+    if parsed.query or parsed.fragment or path != parsed.path or netloc != parsed.netloc:
         value = urllib.parse.urlunsplit(
-            (parsed.scheme, parsed.netloc, path, "", "")
+            (parsed.scheme, netloc, path, "", "")
         )
     return value + trailing
 
 
 def redact_text(value: Any) -> str:
     text = str(value)
+    text = _PRIVATE_KEY_TEXT.sub("[REDACTED PRIVATE KEY]", text)
+    text = _JWT_TEXT.sub("[REDACTED]", text)
+    text = _PROVIDER_KEY_TEXT.sub("[REDACTED]", text)
+    text = _COOKIE_TEXT.sub(r"\1[REDACTED]", text)
     text = _AUTH_TEXT.sub(r"\1[REDACTED]", text)
+    text = _BARE_BEARER_TEXT.sub(r"\1[REDACTED]", text)
     text = _SECRET_TEXT.sub(r"\1\2[REDACTED]\4", text)
     return _URL_TEXT.sub(_redact_url, text)
 
@@ -353,6 +374,16 @@ class MeshStore:
     def __init__(self, settings: Settings):
         self.settings = settings
         self.settings.db.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            descriptor = os.open(self.settings.db, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+            os.close(descriptor)
+        except FileExistsError:
+            pass
+        # SQLite inherits the main file's mode for WAL files. Protect both
+        # existing installations and launches outside systemd's private umask.
+        for path in (self.settings.db, Path(str(self.settings.db) + "-wal"), Path(str(self.settings.db) + "-shm")):
+            if path.exists():
+                path.chmod(0o600)
         self.init_db()
         self.recover_suspended_delegations()
 
@@ -1039,6 +1070,8 @@ class MeshStore:
         self._write_note(path, content, append=True)
 
     def agent_health(self, agent: dict[str, Any], at: datetime | None = None) -> str:
+        if not self.provider_routable(agent, at):
+            return "offline"
         status = str(agent.get("status") or "").lower()
         declared = str(agent.get("health") or "").lower()
         if status in {"offline", "disabled", "unavailable"}:
@@ -1090,11 +1123,52 @@ class MeshStore:
         autonomy = metadata.get("autonomy") if isinstance(metadata, dict) else None
         if str(agent.get("name") or "") == "orchestrator":
             return "control_plane"
+        if not self.provider_routable(agent):
+            code = (autonomy or {}).get("last_failure_code", "provider_error")
+            if code in {"authentication", "permission", "model_unavailable"}:
+                return "provider_blocked"
+            return "rate_limited" if code == "quota" else "degraded"
         if isinstance(autonomy, dict) and autonomy.get("available") is True:
-            return "ready"
+            return "ready" if autonomy.get("last_success_at") and not autonomy.get("last_failure_code") else "configured"
         if self.presence_status(agent) == "online":
             return "cooperative"
         return "queued"
+
+    @staticmethod
+    def provider_routable(agent: dict[str, Any], at: datetime | None = None) -> bool:
+        """Discovery and client heartbeats cannot erase a provider cooldown."""
+        metadata = agent.get("metadata")
+        if not isinstance(metadata, dict):
+            metadata = json_value(agent.get("metadata_json"), {})
+        autonomy = metadata.get("autonomy", {}) if isinstance(metadata, dict) else {}
+        until = parse_time(autonomy.get("cooldown_until")) if isinstance(autonomy, dict) else None
+        return until is None or until <= (at or datetime.now(timezone.utc))
+
+    def record_provider_outcome(
+        self, name: str, *, success: bool, detail: str = "",
+        duration_seconds: float = 0, failure_kind: str = "",
+    ) -> None:
+        """Persist only sanitized execution evidence, independently of GUI presence."""
+        with self.transaction() as database:
+            row = database.execute("SELECT metadata_json FROM agents WHERE name=?", (name,)).fetchone()
+            if row is None:
+                return
+            metadata = json_value(row["metadata_json"], {})
+            state = dict(metadata.get("autonomy") or {})
+            state["last_execution_at"] = utc_now()
+            state["last_duration_seconds"] = round(max(float(duration_seconds), 0), 3)
+            if success:
+                state.update(last_success_at=utc_now(), last_failure_code="", last_error="",
+                             consecutive_failures=0, cooldown_until=None)
+            elif failure_kind != "cancelled":
+                failures = min(int(state.get("consecutive_failures") or 0) + 1, 10)
+                code = failure_kind or "provider_error"
+                base = 300 if code in {"authentication", "permission", "model_unavailable", "quota"} else 15
+                state.update(last_failure_code=code, last_error=redact_text(detail)[:1000],
+                             consecutive_failures=failures,
+                             cooldown_until=after(min(base * 2 ** (failures - 1), 3600)))
+            metadata["autonomy"] = state
+            database.execute("UPDATE agents SET metadata_json=? WHERE name=?", (json_text(metadata), name))
 
     def register_agent(self, data: dict[str, Any]) -> dict[str, Any]:
         name = nonempty_text(data.get("name"), "name", 200)
@@ -1293,7 +1367,7 @@ class MeshStore:
                     SELECT assigned_agent, COUNT(*) AS count
                     FROM tasks
                     WHERE assigned_agent IS NOT NULL
-                      AND status IN ('sent','acknowledged','running','verifying')
+                      AND status IN ('sent','acknowledged','running')
                     GROUP BY assigned_agent
                     """
                 )
@@ -1313,6 +1387,7 @@ class MeshStore:
             autonomy = agent["metadata"].get("autonomy")
             agent["autonomy_ready"] = bool(
                 isinstance(autonomy, dict) and autonomy.get("available") is True
+                and agent["execution_status"] == "ready"
             )
             result.append(agent)
         return result
@@ -1330,12 +1405,13 @@ class MeshStore:
         autonomy = result["metadata"].get("autonomy")
         result["autonomy_ready"] = bool(
             isinstance(autonomy, dict) and autonomy.get("available") is True
+            and result["execution_status"] == "ready"
         )
         with self.connect() as database:
             result["active_task_count"] = database.execute(
                 """
                 SELECT COUNT(*) FROM tasks
-                WHERE assigned_agent=? AND status IN ('sent','acknowledged','running','verifying')
+                WHERE assigned_agent=? AND status IN ('sent','acknowledged','running')
                 """,
                 (result["name"],),
             ).fetchone()[0]
@@ -1729,13 +1805,14 @@ class MeshStore:
         self.sync_message(row)
         return self.decorate_message(row)
 
-    def get_messages(self, agent: str, status: str | None = None) -> list[dict[str, Any]]:
+    def get_messages(self, agent: str, status: str | None = None, limit: int = 100) -> list[dict[str, Any]]:
         query = "SELECT * FROM messages WHERE to_agent=?"
         values: list[Any] = [agent]
         if status:
             query += " AND status=?"
             values.append(status)
-        query += " ORDER BY created_at DESC, id DESC"
+        query += " ORDER BY created_at DESC, id DESC LIMIT ?"
+        values.append(max(1, min(int(limit), 1000)))
         with self.connect() as database:
             return [self.decorate_message(dict(row)) for row in database.execute(query, values)]
 
@@ -2066,7 +2143,17 @@ class MeshStore:
             # normal failures are still allowed to reassign on retry.
             candidates = [explicit]
         elif explicit and int(task.get("attempt") or 0) == 0:
-            candidates = [explicit]
+            preferred = database.execute("SELECT * FROM agents WHERE name=?", (explicit,)).fetchone()
+            run = database.execute("SELECT metadata_json FROM orchestration_runs WHERE id=?", (task.get("run_id"),)).fetchone()
+            autonomous = bool(run and json_value(run["metadata_json"], {}).get("autonomous"))
+            # Autonomous assignments are preferences when the requested client
+            # is offline. Preserve explicit pins for manually managed runs and
+            # for tasks which prohibit reassignment.
+            if not (autonomous and task.get("reassign_on_retry") and
+                    (preferred is None or self.agent_health(dict(preferred)) == "offline")):
+                candidates = [explicit]
+            elif candidates:
+                candidates = [name for name in candidates if name != explicit]
         elif explicit and not int(task.get("reassign_on_retry") or 0):
             candidates = [explicit]
         if candidates:
@@ -2074,7 +2161,7 @@ class MeshStore:
         else:
             allowed = None
         rows = [dict(row) for row in database.execute("SELECT * FROM agents ORDER BY name")]
-        ranked: list[tuple[tuple[int, int, int, int, int, str], dict[str, Any]]] = []
+        ranked: list[tuple[tuple, dict[str, Any]]] = []
         at = datetime.now(timezone.utc)
         for agent in rows:
             name = str(agent["name"])
@@ -2100,7 +2187,7 @@ class MeshStore:
             load = database.execute(
                 """
                 SELECT COUNT(*) FROM tasks
-                WHERE assigned_agent=? AND status IN ('sent','acknowledged','running','verifying')
+                WHERE assigned_agent=? AND status IN ('sent','acknowledged','running')
                 """,
                 (name,),
             ).fetchone()[0]
@@ -2114,6 +2201,9 @@ class MeshStore:
                 skill_matches,
                 limit - int(load),
                 -int(load),
+                bool(json_value(agent.get("metadata_json"), {}).get("autonomy", {}).get("last_success_at")),
+                -int(json_value(agent.get("metadata_json"), {}).get("autonomy", {}).get("consecutive_failures") or 0),
+                -float(json_value(agent.get("metadata_json"), {}).get("autonomy", {}).get("last_duration_seconds") or 0),
                 name,
             )
             ranked.append((score, agent))
@@ -2491,6 +2581,11 @@ class MeshStore:
                         )
                         continue
                     agent_name = str(agent["name"])
+                    if task.get("assigned_agent") and task["assigned_agent"] != agent_name:
+                        self._event(database, "task.fallback_selected", actor="orchestrator",
+                                    run_id=task.get("run_id"), task_id=task["id"],
+                                    payload={"preferred_agent": task["assigned_agent"], "selected_agent": agent_name,
+                                             "reason": "preferred provider is unavailable"})
                     attempt = int(task.get("attempt") or 0) + 1
                     stamp = utc_now()
                     database.execute(
@@ -3006,11 +3101,12 @@ class MeshStore:
         if not task.get("lease_token_hash"):
             return
         token = data.get("_lease_token") or data.get("lease_token")
-        # A body-only call is the legacy v1 compatibility path. New bridge
-        # calls carry caller identity and the scoped token in transport
-        # metadata; an explicitly supplied token is also always validated.
-        if not token and not data.get("_caller_agent"):
+        # Trusted in-process scheduler calls retain compatibility. HTTP clients
+        # cannot select that path by omitting their transport metadata.
+        if not token and not data.get("_caller_agent") and not data.get("_http_request"):
             return
+        if data.get("_caller_agent") and str(data["_caller_agent"]) != agent:
+            raise MeshError("caller does not match the assigned worker", 403)
         self._validate_task_lease(
             database, task, agent, str(token) if token else None, required=True
         )
@@ -3254,7 +3350,7 @@ class MeshStore:
             )
             run = self._run_row(database, str(parent["run_id"]))
             depth = int(parent.get("delegation_depth") or 0) + 1
-            max_depth = int(run.get("max_delegation_depth") or self.settings.max_delegation_depth)
+            max_depth = int(run["max_delegation_depth"] if run.get("max_delegation_depth") is not None else self.settings.max_delegation_depth)
             if depth > max_depth:
                 raise MeshError("delegation exceeds max_delegation_depth")
             task_count = database.execute(
@@ -3806,6 +3902,14 @@ class MeshStore:
         with self.transaction() as database:
             task = self._task_row(database, reference)
             actor = data.get("verified_by") or data.get("agent") or task.get("lead_agent") or "orchestrator"
+            if data.get("_http_request"):
+                caller = str(data.get("_caller_agent") or "")
+                request = database.execute("SELECT auditor_agent FROM autonomous_requests WHERE orchestration_run_id=?", (task.get("run_id"),)).fetchone()
+                allowed = {str(task.get("lead_agent") or "")}
+                if request:
+                    allowed.add(str(request["auditor_agent"] or ""))
+                if not caller or caller != actor or caller not in allowed or caller == task.get("assigned_agent"):
+                    raise MeshError("verification requires the independent lead or assigned auditor", 403)
             stamp = utc_now()
             if task["status"] == "completed" and valid:
                 return self.decorate_task(task)
@@ -4031,6 +4135,10 @@ class MeshStore:
                 "agent",
                 200,
             )
+            current_owner = str(task.get("lease_owner") or "")
+            current_expiry = parse_time(task.get("lease_expires_at"))
+            if current_owner and current_owner != agent and current_expiry and current_expiry > datetime.now(timezone.utc):
+                raise MeshError("task is already leased to another agent", 409)
             seconds = int(data.get("lease_seconds", int(data.get("lease_hours", 1)) * 3600))
             expiry = after(max(seconds, 1))
             database.execute(
@@ -4053,9 +4161,11 @@ class MeshStore:
         self.sync_task(updated)
         return self.decorate_task(updated)
 
-    def release_task(self, reference: Any) -> dict[str, Any]:
+    def release_task(self, reference: Any, actor: str | None = None) -> dict[str, Any]:
         with self.transaction() as database:
             task = self._task_row(database, reference)
+            if actor and task.get("lease_owner") and task["lease_owner"] != actor:
+                raise MeshError("only the current lease owner may release this task", 403)
             database.execute(
                 "UPDATE tasks SET lease_owner=NULL, lease_expires_at=NULL, lease_token_hash=NULL, lease_token_expires_at=NULL, updated_at=? WHERE id=?",
                 (utc_now(), task["id"]),
@@ -4400,6 +4510,17 @@ class MeshStore:
         workspace = workspace.resolve()
         if not workspace.exists() or not workspace.is_dir():
             raise MeshError("workspace must be an existing directory")
+        configured_roots = os.environ.get("AGENT_MESH_WORKSPACE_ROOTS", "").strip()
+        roots = [
+            Path(item).expanduser().resolve()
+            for item in configured_roots.split(os.pathsep)
+            if item.strip()
+        ] or [self.settings.root.resolve()]
+        if not any(
+            workspace == root or root in workspace.parents
+            for root in roots
+        ):
+            raise MeshError("workspace is outside the configured Agent Mesh roots", 403)
         try:
             requested_rounds = int(
                 data.get("max_rounds", self.settings.autonomy_max_rounds)
@@ -4592,6 +4713,14 @@ class MeshStore:
         actor = data.get("finalized_by") or data.get("agent") or "orchestrator"
         with self.transaction() as database:
             run = self._run_row(database, run_id)
+            if data.get("_http_request"):
+                caller = str(data.get("_caller_agent") or "")
+                request = database.execute("SELECT integrator_agent FROM autonomous_requests WHERE orchestration_run_id=?", (run_id,)).fetchone()
+                allowed = {str(run.get("lead_agent") or "")}
+                if request:
+                    allowed.add(str(request["integrator_agent"] or ""))
+                if not caller or caller != actor or caller not in allowed:
+                    raise MeshError("finalization requires the lead or assigned integrator", 403)
             if run["state"] == "CANCELLED":
                 raise MeshError("cannot finalize a cancelled run", 409)
             tasks = [
@@ -4712,6 +4841,22 @@ class MeshStore:
                 reference = parse_time(task.get("sent_at") if task["status"] == "sent" else task.get("ack_at") or task.get("started_at"))
                 if reference is None:
                     continue
+                # Supervisor-owned autonomous providers claim their durable
+                # queue item from the worker future immediately after
+                # dispatch.  A short cooperative acknowledgement timeout
+                # must not race that scheduler handoff and turn a healthy
+                # executable provider into a retry before it starts.
+                if task["status"] == "sent" and task.get("run_id"):
+                    agent_row = database.execute(
+                        "SELECT metadata_json FROM agents WHERE name=?",
+                        (task.get("assigned_agent"),),
+                    ).fetchone()
+                    metadata = json_value(
+                        agent_row["metadata_json"] if agent_row else None, {}
+                    )
+                    autonomy = metadata.get("autonomy") if isinstance(metadata, dict) else None
+                    if isinstance(autonomy, dict) and autonomy.get("available") is True:
+                        continue
                 timeout = (
                     float(task.get("ack_timeout_seconds") or self.settings.ack_timeout)
                     if task["status"] == "sent"

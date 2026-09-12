@@ -131,8 +131,14 @@ def _atomic_write(path: Path, value: dict[str, Any], mode: int | None) -> None:
 
 
 def _backup(path: Path, backup_dir: Path) -> None:
-    backup_dir.mkdir(parents=True, exist_ok=True)
-    shutil.copy2(path, backup_dir / path.name)
+    backup_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+    backup_dir.chmod(0o700)
+    # Several clients use mcp_config.json or opencode.json. Preserve each
+    # original separately, with private permissions for auth-bearing files.
+    import hashlib
+    target = backup_dir / (hashlib.sha256(str(path).encode()).hexdigest()[:12] + "-" + path.name)
+    shutil.copy2(path, target)
+    target.chmod(0o600)
 
 
 POLICY_START = "<!-- agent-mesh-policy:start -->"

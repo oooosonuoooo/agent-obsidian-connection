@@ -2,14 +2,20 @@
 Description=Agent Mesh Service for AI Second Brain
 After=network-online.target
 Wants=network-online.target
+StartLimitIntervalSec=300
+StartLimitBurst=10
 
 [Service]
 Type=simple
 WorkingDirectory=%h/AI-Second-Brain
 EnvironmentFile=-%h/AI-Second-Brain/.env.local
+Environment=PATH=%h/.local/bin:%h/.opencode/bin:%h/.npm-global/bin:/usr/local/bin:/usr/bin:/bin
 ExecStart=/usr/bin/python3 %h/AI-Second-Brain/.agent_mesh/scripts/agent_mesh_service.py
 Restart=always
 RestartSec=5
+StandardInput=null
+UnsetEnvironment=DISPLAY WAYLAND_DISPLAY SWAYSOCK
+KillMode=control-group
 StandardOutput=append:%h/AI-Second-Brain/.agent_mesh/logs/agent_mesh.log
 StandardError=append:%h/AI-Second-Brain/.agent_mesh/logs/agent_mesh.log
 UMask=0077

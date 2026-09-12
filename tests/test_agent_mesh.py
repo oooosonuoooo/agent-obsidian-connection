@@ -54,6 +54,7 @@ def make_settings(
         max_delegation_depth=3,
         reaper_interval=0.1,
         max_body_bytes=1024 * 1024,
+        admin_token="unit-test-admin",
         autonomy_enabled=autonomy_enabled,
         autonomy_interval=0.05,
         autonomy_max_workers=4,
@@ -995,6 +996,10 @@ class AutonomousSupervisorTests(MeshTestCase):
                 "cooperative-task",
                 {"verified_by": "Lead", "valid": True},
             )
+            # Verified worker evidence alone cannot stand in for an actual
+            # integration. A returning headless integrator resumes this run.
+            self.wait_for_state(manager, submitted["id"], "WAITING")
+            self.register_adapter("Integrator", ["orchestration"], {"summary": "Integrated cooperative result"})
             completed = self.wait_for_terminal(manager, submitted["id"])
         finally:
             manager.stop()
@@ -1004,7 +1009,7 @@ class AutonomousSupervisorTests(MeshTestCase):
         self.assertEqual(completed["state"], "COMPLETED")
         self.assertEqual(
             completed["report"]["final_result"]["integration_mode"],
-            "evidence_aggregation",
+            "provider",
         )
         with store.connect() as database:
             types = {
@@ -1147,17 +1152,21 @@ class HTTPAndMCPTests(MeshTestCase):
         self.assertEqual({task["task_key"] for task in tasks}, {"one", "two"})
 
         for task_key, agent in (("one", "WorkerOne"), ("two", "WorkerTwo")):
-            status, inbox = self.http_request(
-                base_url, "POST", "/tasks/poll", {"agent": agent, "limit": 1}
+            status, inbox, lease_headers = self.http_request(
+                base_url, "POST", "/tasks/poll", {"agent": agent, "limit": 1},
+                extra_headers={"X-Agent-Mesh-Agent": agent}, return_headers=True
             )
             self.assertEqual(status, 200)
             self.assertEqual(len(inbox), 1)
             message_id = inbox[0]["message"]["id"]
+            transport = {"X-Agent-Mesh-Agent": agent,
+                         "X-Agent-Mesh-Task-Lease": lease_headers["X-Agent-Mesh-Task-Lease"]}
             status, acknowledged = self.http_request(
                 base_url,
                 "POST",
                 f"/tasks/{task_key}/ack",
                 {"agent": agent, "message_id": message_id},
+                extra_headers=transport,
             )
             self.assertEqual(status, 200)
             self.assertEqual(acknowledged["status"], "acknowledged")
@@ -1166,6 +1175,7 @@ class HTTPAndMCPTests(MeshTestCase):
                 "POST",
                 f"/tasks/{task_key}/progress",
                 {"agent": agent, "progress": 100, "summary": "finished"},
+                extra_headers=transport,
             )
             self.assertEqual(status, 200)
             self.assertEqual(progressed["status"], "running")
@@ -1177,6 +1187,7 @@ class HTTPAndMCPTests(MeshTestCase):
                     "agent": agent,
                     "result": {"summary": f"{task_key} result", "tests": ["http"]},
                 },
+                extra_headers=transport,
             )
             self.assertEqual(status, 200)
             self.assertEqual(submitted["status"], "verifying")
@@ -1185,6 +1196,7 @@ class HTTPAndMCPTests(MeshTestCase):
                 "POST",
                 f"/tasks/{task_key}/verify",
                 {"verified_by": "Lead", "valid": True},
+                extra_headers={"X-Agent-Mesh-Agent": "Lead"},
             )
             self.assertEqual(status, 200)
             self.assertEqual(verified["status"], "completed")
@@ -1194,6 +1206,7 @@ class HTTPAndMCPTests(MeshTestCase):
             "POST",
             "/orchestration/runs/http-e2e/finalize",
             {"finalized_by": "Lead", "result": {"summary": "HTTP e2e complete"}},
+            extra_headers={"X-Agent-Mesh-Agent": "Lead"},
         )
         self.assertEqual(status, 200)
         self.assertEqual(final["state"], "COMPLETED")
@@ -1284,6 +1297,7 @@ class HTTPAndMCPTests(MeshTestCase):
             "POST",
             "/tasks/poll",
             {"agent": "Parent", "limit": 1},
+            extra_headers={"X-Agent-Mesh-Agent": "Parent"},
             return_headers=True,
         )
         self.assertEqual(status, 200)
@@ -1424,6 +1438,7 @@ class HTTPAndMCPTests(MeshTestCase):
                 "POST",
                 "/agents/register",
                 payload,
+                extra_headers={"X-Agent-Mesh-Admin": "unit-test-admin"},
             )
             self.assertEqual(status, 200)
 
@@ -1456,7 +1471,10 @@ class HTTPAndMCPTests(MeshTestCase):
         current = submitted
         while current["state"] not in {"COMPLETED", "FAILED", "BLOCKED", "CANCELLED"}:
             if time.monotonic() >= deadline:
-                self.fail("HTTP autonomous run did not finish")
+                self.fail("HTTP autonomous run did not finish: " + json.dumps({
+                    "state": current.get("state"), "error": current.get("error"),
+                    "tasks": [(t.get("task_key"), t.get("status")) for t in (current.get("orchestration") or {}).get("tasks", [])],
+                }))
             time.sleep(0.05)
             status, current = self.http_request(
                 base_url, "GET", "/autonomous/runs/" + request_id
@@ -1508,6 +1526,7 @@ class HTTPAndMCPTests(MeshTestCase):
             "POST",
             f"/tasks/{task_id}/claim",
             {"agent": "LegacyAgent", "lease_seconds": 60},
+            extra_headers={"X-Agent-Mesh-Agent": "LegacyAgent"},
         )
         self.assertEqual(status, 200)
         self.assertEqual(claimed["lease_owner"], "LegacyAgent")
@@ -1516,11 +1535,13 @@ class HTTPAndMCPTests(MeshTestCase):
             "POST",
             f"/tasks/{task_id}/heartbeat",
             {"agent": "LegacyAgent"},
+            extra_headers={"X-Agent-Mesh-Agent": "LegacyAgent"},
         )
         self.assertEqual(status, 200)
         self.assertEqual(heartbeated["last_active_agent"], "LegacyAgent")
         status, released = self.http_request(
-            base_url, "POST", f"/tasks/{task_id}/release", {}
+            base_url, "POST", f"/tasks/{task_id}/release", {},
+            extra_headers={"X-Agent-Mesh-Agent": "LegacyAgent"}
         )
         self.assertEqual(status, 200)
         self.assertIsNone(released["lease_owner"])

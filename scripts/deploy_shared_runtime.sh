@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
+umask 077
 
 # Install the control-plane scripts once into the shared runtime directory.
 # Existing Gemini, Antigravity, Codex, and OpenCode MCP entries point there;
@@ -12,12 +13,22 @@ fi
 TARGET="$ROOT/.agent_mesh/scripts"
 BACKUP="$ROOT/.agent_mesh/backups/agent-mesh-$(date -u +%Y%m%dT%H%M%SZ)"
 
-mkdir -p "$TARGET" "$BACKUP"
-for name in agent_mesh_core.py agent_mesh_service.py agent_mesh_mcp_stdio.py agent_mesh_adapters.py agent_mesh_autonomy.py configure_shared_agents.py sync_shared_catalog.py start_agent_mesh.sh agent_mesh.service; do
+mkdir -p "$TARGET" "$BACKUP" "$ROOT/.agent_mesh/logs"
+chmod 700 "$ROOT/.agent_mesh" "$BACKUP" "$ROOT/.agent_mesh/logs" "$TARGET"
+if [ -e "$ROOT/.agent_mesh/agent_mesh.sqlite" ]; then
+  chmod 600 "$ROOT/.agent_mesh/agent_mesh.sqlite"
+fi
+for log_file in "$ROOT/.agent_mesh/logs"/*.log; do
+  if [ -e "$log_file" ]; then
+    chmod 600 "$log_file"
+  fi
+done
+for name in agent_mesh_core.py agent_mesh_service.py agent_mesh_mcp_stdio.py agent_mesh_adapters.py agent_mesh_autonomy.py obsidian_vault_mcp_stdio.py configure_shared_agents.py sync_shared_catalog.py start_agent_mesh.sh agent_mesh.service; do
   if [ -e "$TARGET/$name" ]; then
     cp -a -- "$TARGET/$name" "$BACKUP/$name"
   fi
-  cp -a -- "$SCRIPT_DIR/$name" "$TARGET/$name"
+  cp -a -- "$SCRIPT_DIR/$name" "$TARGET/.$name.new"
+  mv -f -- "$TARGET/.$name.new" "$TARGET/$name"
 done
 
 chmod 755 "$TARGET/agent_mesh_service.py" "$TARGET/agent_mesh_mcp_stdio.py" "$TARGET/agent_mesh_adapters.py" "$TARGET/agent_mesh_autonomy.py" "$TARGET/configure_shared_agents.py" "$TARGET/sync_shared_catalog.py" "$TARGET/start_agent_mesh.sh"
@@ -41,7 +52,7 @@ systemctl --user daemon-reload
 systemctl --user enable "$UNIT_NAME" >/dev/null
 
 AI_SECOND_BRAIN_ROOT="$ROOT" python3 "$TARGET/sync_shared_catalog.py"
-python3 "$TARGET/configure_shared_agents.py"
+AI_SECOND_BRAIN_ROOT="$ROOT" python3 "$TARGET/configure_shared_agents.py"
 printf 'Shared Agent Mesh runtime installed at %s\n' "$TARGET"
 printf 'Previous runtime backed up at %s\n' "$BACKUP"
 printf 'Auto-start unit enabled: %s\n' "$UNIT_NAME"
