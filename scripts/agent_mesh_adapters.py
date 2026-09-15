@@ -871,33 +871,17 @@ class AdapterRegistry:
             for capability in spec.capabilities:
                 capabilities.setdefault(capability, True)
             capabilities["autonomous_worker"] = True
-            metadata = _agent_metadata(agent)
-            autonomy = metadata.get("autonomy")
-            if not isinstance(autonomy, dict):
-                autonomy = {}
-            autonomy.update(
-                {
-                    "adapter_kind": spec.kind,
-                    "adapter_source": spec.source,
-                    "available": True,
-                }
-            )
-            metadata["autonomy"] = autonomy
-            self.store.register_agent(
-                {
-                    "name": name,
-                    "provider": agent.get("provider") or "",
-                    "model": agent.get("model") or spec.model,
-                    "type": agent.get("type") or "worker",
-                    "capabilities": capabilities,
-                    "limitations": agent.get("limitations") or "",
-                    "status": "active",
-                    "health": "online",
-                    "endpoint": agent.get("endpoint") or spec.endpoint,
-                    "max_concurrent_tasks": agent.get("max_concurrent_tasks") or 1,
-                    "heartbeat_interval_seconds": agent.get("heartbeat_interval_seconds") or 30,
-                    "metadata": metadata,
-                }
+            # Refreshing a builtin adapter must not refresh client presence.
+            # Registration is also used during service bootstrap, where a
+            # stale GUI client must remain offline until its real heartbeat.
+            self.store.update_agent_adapter_state(
+                name,
+                available=True,
+                adapter_kind=spec.kind,
+                adapter_source=spec.source,
+                capabilities=capabilities,
+                endpoint=spec.endpoint,
+                model=spec.model,
             )
         # Keep Kiro registered even when its CLI is not installed or
         # authenticated so routing can queue it truthfully until a real CLI

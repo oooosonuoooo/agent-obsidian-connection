@@ -377,7 +377,27 @@ class MeshRequestHandler(BaseHTTPRequestHandler):
                 return self.respond(self.store.heartbeat_agent(parts[1], data))
 
             if path == "/messages":
-                return self.respond(self.store.create_message(data), 201)
+                message_data = dict(data)
+                if not message_data.get("from_agent") and data.get("_caller_agent"):
+                    message_data["from_agent"] = data["_caller_agent"]
+                message_payload = message_data.get("payload")
+                if not isinstance(message_payload, dict):
+                    message_payload = {}
+                else:
+                    message_payload = dict(message_payload)
+                # Only messages created through this current API path are
+                # eligible for safe restart recovery.  Historical queued
+                # messages must not be executed unexpectedly after upgrade.
+                message_payload["auto_activate_if_inactive"] = True
+                message_data["payload"] = message_payload
+                message = self.store.create_message(message_data)
+                activation = self.server.autonomy.activate_message(message)
+                try:
+                    message = self.store.get_message(message["id"])
+                except MeshError:
+                    pass
+                message["activation"] = activation
+                return self.respond(message, 201)
             if len(parts) == 3 and parts[0] == "messages" and parts[2] == "ack":
                 task_ref = data.get("task_id")
                 if task_ref is None:

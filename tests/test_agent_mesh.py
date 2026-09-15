@@ -537,6 +537,65 @@ class AgentMeshCoreTests(MeshTestCase):
         self.assertEqual(recovered["tasks"][0]["status"], "failed")
         self.assertGreaterEqual(len(recovered["events"]), 5)
 
+    def test_stale_verification_is_failed_and_releases_capacity(self) -> None:
+        self.register("VerifierWorker", ["python"])
+        run = self.store.create_run(
+            {
+                "run_id": "stale-verification-run",
+                "request": "Recover a verification abandoned by a service restart",
+                "lead_agent": "Lead",
+                "plan": {
+                    "tasks": [
+                        {
+                            "task_id": "stale-verification",
+                            "assigned_agent": "VerifierWorker",
+                        }
+                    ]
+                },
+            }
+        )
+        item = self.store.poll_tasks("VerifierWorker", 1)[0]
+        self.store.acknowledge_task(
+            "stale-verification",
+            {
+                "agent": "VerifierWorker",
+                "message_id": item["message"]["id"],
+                "_lease_token": item["lease_token"],
+            },
+        )
+        self.store.task_progress(
+            "stale-verification",
+            {
+                "agent": "VerifierWorker",
+                "progress": 100,
+                "summary": "work finished",
+                "_lease_token": item["lease_token"],
+            },
+        )
+        submitted = self.store.submit_result(
+            "stale-verification",
+            {
+                "agent": "VerifierWorker",
+                "_lease_token": item["lease_token"],
+                "idempotency_key": "stale-verification-result",
+                "result": {"summary": "result awaiting audit"},
+            },
+        )
+        self.assertEqual(submitted["status"], "verifying")
+        with self.store.transaction() as database:
+            database.execute(
+                "UPDATE tasks SET result_received_at='2000-01-01T00:00:00+00:00', updated_at='2000-01-01T00:00:00+00:00' WHERE task_key='stale-verification'"
+            )
+
+        self.assertEqual(self.store.reap_timeouts(), 1)
+        recovered = self.store.get_task("stale-verification")
+        self.assertEqual(recovered["status"], "failed")
+        self.assertEqual(
+            recovered["error"]["message"],
+            "verification timeout after service recovery",
+        )
+        self.assertEqual(self.store.get_run(run["id"])["state"], "FAILED")
+
     def test_dependencies_block_after_failed_prerequisite(self) -> None:
         self.register("Worker", ["python"])
         run = self.store.create_run(

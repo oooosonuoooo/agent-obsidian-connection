@@ -86,6 +86,73 @@ class HeadlessOrchestrationTests(unittest.TestCase):
         self.store.record_provider_outcome('Bad', success=False, failure_kind='quota')
         self.assertEqual(self.manager._choose_spec({'auditor_agent': 'Bad'}, 'auditor').agent, 'Good')
 
+    def test_inactive_executable_agent_is_auto_activated_for_direct_message(self):
+        self.manager.enabled = True
+        self.store.register_agent({
+            'name': 'Headless',
+            'status': 'offline',
+            'capabilities': ['analysis'],
+            'metadata': {'autonomy': {'available': True, 'adapter_kind': 'command'}},
+        })
+        spec = AdapterSpec(
+            'Headless', 'command',
+            (sys.executable, '-c', 'print("{\\"summary\\":\\"automatic reply\\"}")'),
+            capabilities=('analysis',),
+        )
+        self.manager.registry._specs['Headless'] = spec
+        message = self.store.create_message({
+            'from_agent': 'Lead',
+            'to_agent': 'Headless',
+            'subject': 'Wake up',
+            'body': 'Reply without changing files.',
+        })
+
+        activation = self.manager.activate_message(message)
+        self.assertTrue(activation['activated'])
+        self.manager._futures['message:' + str(message['id'])].result(timeout=3)
+
+        current = self.store.get_message(message['id'])
+        self.assertEqual(current['status'], 'completed')
+        self.assertEqual(current['payload']['activation_result']['summary'], 'automatic reply')
+        replies = self.store.get_messages('Lead')
+        self.assertTrue(any(item['reply_to'] == message['message_key'] for item in replies))
+
+        recovered = self.store.create_message({
+            'from_agent': 'Lead', 'to_agent': 'Headless',
+            'subject': 'Recover me', 'body': 'The prior process was restarted.',
+        })
+        self.store.update_message_status(recovered['id'], 'sent')
+        activation = self.manager.activate_message(self.store.get_message(recovered['id']))
+        self.assertTrue(activation['activated'])
+        self.manager._futures['message:' + str(recovered['id'])].result(timeout=3)
+        self.assertEqual(self.store.get_message(recovered['id'])['status'], 'completed')
+
+    def test_inactive_cooperative_agent_stays_queued_without_fabricated_activation(self):
+        self.store.register_agent({
+            'name': 'GUI', 'status': 'offline', 'capabilities': ['analysis'],
+        })
+        message = self.store.create_message({
+            'from_agent': 'Lead', 'to_agent': 'GUI',
+            'subject': 'Needs a live session', 'body': 'Do this in the GUI.',
+        })
+        activation = self.manager.activate_message(message)
+        self.assertFalse(activation['activated'])
+        self.assertEqual(self.store.get_message(message['id'])['status'], 'queued')
+
+    def test_restart_recovery_only_selects_explicit_activation_messages(self):
+        historical = self.store.create_message({
+            'from_agent': 'Lead', 'to_agent': 'GUI',
+            'subject': 'Historical', 'body': 'Do not replay this old request.',
+        })
+        marked = self.store.create_message({
+            'from_agent': 'Lead', 'to_agent': 'GUI',
+            'subject': 'Marked', 'body': 'Recover this request.',
+            'payload': {'auto_activate_if_inactive': True},
+        })
+        pending = self.store.list_queued_direct_messages()
+        self.assertEqual([item['id'] for item in pending], [marked['id']])
+        self.assertNotIn(historical['id'], [item['id'] for item in pending])
+
     def test_planning_does_not_block_other_scheduler_work(self):
         request = self.store.create_autonomous_request({'objective': 'Plan slowly', 'workspace': str(self.base), 'lead_agent': 'Lead'})
         started = threading.Event()

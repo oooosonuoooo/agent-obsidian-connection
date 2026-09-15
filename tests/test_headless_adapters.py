@@ -206,6 +206,36 @@ class HeadlessAdapterTests(unittest.TestCase):
             self.assertTrue(self.registry.preflight(spec)[0])
             command.chmod(0o600)
 
+    def test_builtin_refresh_does_not_refresh_client_presence(self):
+        import agent_mesh_adapters
+
+        self.store.register_agent({
+            "name": "Existing",
+            "status": "busy",
+            "health": "busy",
+            "capabilities": ["analysis"],
+            "metadata": {
+                "autonomy_adapter": {
+                    "kind": "command",
+                    "argv": [sys.executable, "-c", "print('ok')"],
+                }
+            },
+        })
+        old_seen = "2026-01-01T00:00:00+00:00"
+        with self.store.transaction() as database:
+            database.execute(
+                "UPDATE agents SET last_seen_at=? WHERE name='Existing'", (old_seen,)
+            )
+        original_profiles = agent_mesh_adapters.BUILTIN_AGENT_PROFILES
+        agent_mesh_adapters.BUILTIN_AGENT_PROFILES = ()
+        try:
+            self.registry.ensure_builtin_registrations()
+        finally:
+            agent_mesh_adapters.BUILTIN_AGENT_PROFILES = original_profiles
+        current = self.store.get_agent("Existing")
+        self.assertEqual(current["last_seen_at"], old_seen)
+        self.assertEqual(current["status"], "busy")
+
     def test_ollama_model_probe_requires_exact_explicit_tag(self):
         cases = [
             ("model:7b", ["model:8b"], False),

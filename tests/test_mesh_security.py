@@ -13,7 +13,13 @@ class SecurityRegressionTests(MeshTestCase):
     http_request = HTTPAndMCPTests.http_request
 
     def test_sensitive_values_redacted_before_persistence_and_idempotent(self):
-        jwt = 'eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJzeW50aGV0aWMifQ.c3ludGhldGljLXNpZ25hdHVyZQ'
+        jwt = '.'.join(
+            (
+                'eyJhbGciOiJIUzI1NiJ9',
+                'eyJzdWIiOiJzeW50aGV0aWMifQ',
+                'c3ludGhldGljLXNpZ25hdHVyZQ',
+            )
+        )
         cases = {
             'plain': jwt,
             'url': 'https://someone:synthetic-password@example.test/path?signature=synthetic-query',

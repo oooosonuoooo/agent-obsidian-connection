@@ -37,6 +37,16 @@ lifecycle. A message could therefore be stored successfully while no receiving
 agent was ever invoked and the sender had no reliable way to distinguish
 delivery from completion.
 
+Direct messages now also have an on-demand activation path. When the target
+client heartbeat is offline but a real supervisor-owned command, HTTP, MCP, or
+Ollama adapter is available, the service activates that adapter, records the
+message transition and provider result, and queues a durable reply for the
+sender. A cooperative or unavailable agent remains queued until its real client
+heartbeat or adapter becomes available; the mesh never pretends that a GUI
+session is active. Only messages submitted through the current service API carry
+the explicit restart-recovery marker, so historical queued messages are not
+replayed unexpectedly after an upgrade.
+
 The repair keeps the legacy routes and adds a deterministic control plane. It
 does not fabricate provider responses. A worker result is recorded only when a
 real agent calls the worker API/MCP operation.

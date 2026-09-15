@@ -1680,6 +1680,116 @@ class MeshStore:
         result["payload"] = json_value(result.get("payload_json"), {})
         return result
 
+    def get_message(self, message_id: int | str) -> dict[str, Any]:
+        try:
+            reference = int(message_id)
+        except (TypeError, ValueError) as exc:
+            raise MeshError("message id is invalid") from exc
+        with self.connect() as database:
+            row = database.execute(
+                "SELECT * FROM messages WHERE id=?", (reference,)
+            ).fetchone()
+        if row is None:
+            raise MeshError("message not found", 404)
+        return self.decorate_message(dict(row))
+
+    def list_queued_direct_messages(self, limit: int = 100) -> list[dict[str, Any]]:
+        """Return direct messages that need activation or restart recovery."""
+        bounded = max(1, min(int(limit), 1000))
+        with self.connect() as database:
+            rows = list(
+                database.execute(
+                    """
+                    SELECT * FROM messages
+                    WHERE message_type='DIRECT_MESSAGE'
+                      AND status IN ('queued', 'sent')
+                      AND payload_json LIKE '%"auto_activate_if_inactive":true%'
+                    ORDER BY created_at ASC, id ASC LIMIT ?
+                    """,
+                    (bounded,),
+                )
+            )
+        return [self.decorate_message(dict(row)) for row in rows]
+
+    def update_message_status(
+        self,
+        message_id: int | str,
+        status: str,
+        *,
+        error: str | None = None,
+        result: Any = None,
+    ) -> dict[str, Any]:
+        """Persist direct-message activation without exposing provider secrets."""
+        try:
+            reference = int(message_id)
+        except (TypeError, ValueError) as exc:
+            raise MeshError("message id is invalid") from exc
+        next_status = nonempty_text(status, "status", 40)
+        terminal = {
+            "completed",
+            "failed",
+            "cancelled",
+            "rejected",
+            "expired",
+            "result_received",
+        }
+        with self.transaction() as database:
+            current = database.execute(
+                "SELECT * FROM messages WHERE id=?", (reference,)
+            ).fetchone()
+            if current is None:
+                raise MeshError("message not found", 404)
+            current_data = dict(current)
+            updates = ["status=?"]
+            values: list[Any] = [next_status]
+            stamp = utc_now()
+            if next_status in {"sent", "delivered", "acknowledged"}:
+                updates.append("sent_at=COALESCE(sent_at, ?)")
+                values.append(stamp)
+            if next_status == "delivered":
+                updates.append("delivered_at=COALESCE(delivered_at, ?)")
+                values.append(stamp)
+            if next_status == "acknowledged":
+                updates.append("acknowledged_at=COALESCE(acknowledged_at, ?)")
+                values.append(stamp)
+            if next_status in terminal:
+                updates.append("completed_at=COALESCE(completed_at, ?)")
+                values.append(stamp)
+            if error is not None:
+                updates.append("error=?")
+                values.append(redact_text(error)[:2000])
+            if result is not None:
+                payload = json_value(current_data.get("payload_json"), {})
+                if not isinstance(payload, dict):
+                    payload = {}
+                payload = dict(payload)
+                payload["activation_result"] = sanitize(result)
+                updates.append("payload_json=?")
+                values.append(json_text(payload, {}))
+            values.append(reference)
+            database.execute(
+                "UPDATE messages SET " + ", ".join(updates) + " WHERE id=?",
+                values,
+            )
+            self._event(
+                database,
+                "message.status_changed",
+                actor=current_data.get("to_agent"),
+                message_id=reference,
+                payload={
+                    "from": current_data.get("status") or "queued",
+                    "to": next_status,
+                    "error": redact_text(error)[:500] if error else "",
+                },
+            )
+            row = database.execute(
+                "SELECT * FROM messages WHERE id=?", (reference,)
+            ).fetchone()
+        assert row is not None
+        decorated = self.decorate_message(dict(row))
+        self.sync_message(dict(row))
+        return decorated
+
     def _event(
         self,
         database: sqlite3.Connection,
@@ -1793,6 +1903,7 @@ class MeshStore:
                 correlation_id=data.get("correlation_id"),
                 conversation_id=data.get("conversation_id"),
                 idempotency_key=data.get("idempotency_key"),
+                reply_to=data.get("reply_to"),
             )
             self._event(
                 database,
@@ -4834,11 +4945,25 @@ class MeshStore:
             rows = [
                 dict(row)
                 for row in database.execute(
-                    "SELECT * FROM tasks WHERE status IN ('sent','acknowledged','running')"
+                    "SELECT * FROM tasks WHERE status IN ('sent','acknowledged','running','verifying')"
                 )
             ]
             for task in rows:
-                reference = parse_time(task.get("sent_at") if task["status"] == "sent" else task.get("ack_at") or task.get("started_at"))
+                if task["status"] == "verifying":
+                    # Verification has no worker lease, so a service restart
+                    # can otherwise leave the task occupying a global slot
+                    # forever.  Do not rerun an already-completed worker task
+                    # merely because its independent audit was lost; preserve
+                    # the result as rejected and release its artifacts.
+                    reference = parse_time(
+                        task.get("result_received_at") or task.get("updated_at")
+                    )
+                else:
+                    reference = parse_time(
+                        task.get("sent_at")
+                        if task["status"] == "sent"
+                        else task.get("ack_at") or task.get("started_at")
+                    )
                 if reference is None:
                     continue
                 # Supervisor-owned autonomous providers claim their durable
@@ -4863,6 +4988,59 @@ class MeshStore:
                     else float(task.get("execution_timeout_seconds") or self.settings.execution_timeout)
                 )
                 if (now_dt - reference).total_seconds() < timeout:
+                    continue
+                if task["status"] == "verifying":
+                    stamp = utc_now()
+                    reason = {
+                        "message": "verification timeout after service recovery",
+                        "status": "verifying",
+                    }
+                    database.execute(
+                        """
+                        UPDATE tasks
+                        SET status='failed', error_json=?, failed_at=?, updated_at=?,
+                            waiting_reason=?, verification_status='rejected',
+                            lease_owner=NULL, lease_expires_at=NULL,
+                            lease_token_hash=NULL, lease_token_expires_at=NULL
+                        WHERE id=? AND status='verifying'
+                        """,
+                        (
+                            json_text(reason, {}),
+                            stamp,
+                            stamp,
+                            reason["message"],
+                            task["id"],
+                        ),
+                    )
+                    database.execute(
+                        "UPDATE task_results SET status='rejected' WHERE task_id=? AND status='submitted'",
+                        (task["id"],),
+                    )
+                    database.execute(
+                        """
+                        UPDATE messages SET status='expired', error=?, completed_at=COALESCE(completed_at, ?)
+                        WHERE task_id=? AND message_type='TASK_REQUEST' AND status='result_received'
+                        """,
+                        (redact_text(json.dumps(reason, sort_keys=True)), stamp, task["id"]),
+                    )
+                    self._release_artifacts(database, int(task["id"]))
+                    self._event(
+                        database,
+                        "task.verification_timeout",
+                        actor="orchestrator",
+                        run_id=task.get("run_id") or None,
+                        task_id=task["id"],
+                        payload=reason,
+                    )
+                    self._event(
+                        database,
+                        "task.failed",
+                        actor="orchestrator",
+                        run_id=task.get("run_id") or None,
+                        task_id=task["id"],
+                        payload=reason,
+                    )
+                    changed += 1
                     continue
                 reason = {
                     "message": "acknowledgement timeout" if task["status"] == "sent" else "execution timeout",
